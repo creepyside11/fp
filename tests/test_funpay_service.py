@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -190,6 +191,66 @@ class ChatHistoryServiceTests(unittest.TestCase):
         account = SimpleNamespace(get_sells=lambda: (None, orders))
 
         self.assertEqual(asyncio.run(FunPayService().orders(account)), orders)
+
+    def test_parser_fallback_skips_unsupported_service_widget(self):
+        class Account:
+            id = 42
+            username = "Seller"
+            bot_character = "\u2063"
+
+            def get_chat_history(self, chat_id, interlocutor_username=None):
+                raise AttributeError("message-text is missing")
+
+            def method(self, method, url, headers, payload, raise_not_200=False):
+                response = requests.Response()
+                response.status_code = 200
+                response._content = json.dumps(
+                    {
+                        "chat": {
+                            "messages": [
+                                {
+                                    "id": 500,
+                                    "author": 7,
+                                    "html": "<div class='unsupported-widget'></div>",
+                                },
+                                {
+                                    "id": 501,
+                                    "author": 7,
+                                    "html": (
+                                        "<div class='media-user-name'><a>Buyer</a></div>"
+                                        "<div class='message-text'>Hello</div>"
+                                    ),
+                                },
+                            ]
+                        }
+                    }
+                ).encode()
+                return response
+
+        messages = FunPayService._chat_history(Account(), 123, "Buyer")
+
+        self.assertEqual([message.id for message in messages], [501])
+        self.assertEqual(messages[0].text, "Hello")
+        self.assertEqual(messages[0].author, "Buyer")
+
+    def test_chat_history_retries_transient_proxy_error(self):
+        class Account:
+            def __init__(self):
+                self.calls = 0
+
+            def get_chat_history(self, chat_id, interlocutor_username=None):
+                self.calls += 1
+                if self.calls < 3:
+                    raise requests.exceptions.ProxyError("temporary proxy timeout")
+                return [SimpleNamespace(id=501)]
+
+        account = Account()
+        with patch("funpay_service.time.sleep") as sleep:
+            messages = FunPayService._chat_history(account, 123, "Buyer")
+
+        self.assertEqual(messages[0].id, 501)
+        self.assertEqual(account.calls, 3)
+        self.assertEqual(sleep.call_count, 2)
 
 
 class FakeBot:

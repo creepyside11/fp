@@ -179,28 +179,131 @@ class FunPayService:
             chat_id = int(chat_id)
         return await self._thread(account.send_message, chat_id, text, chat_name)
 
+    @staticmethod
+    def _parse_chat_history_fallback(
+        account: Account, chat_id: int | str, chat_name: str | None
+    ) -> list[Any]:
+        """Parse history while ignoring unsupported FunPay service-message layouts."""
+
+        last_message_id = 99999999999999999999999
+        response = account.method(
+            "get",
+            f"chat/history?node={chat_id}&last_message={last_message_id}",
+            {"accept": "*/*", "x-requested-with": "XMLHttpRequest"},
+            {"node": chat_id, "last_message": last_message_id},
+            raise_not_200=True,
+        )
+        raw_messages = (response.json().get("chat") or {}).get("messages", [])
+        messages: list[Any] = []
+        for raw in raw_messages:
+            try:
+                message_id = int(raw["id"])
+                author_id = int(raw["author"])
+                message_html = raw["html"]
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            parser = BeautifulSoup(message_html, "html.parser")
+            image = parser.find("a", {"class": "chat-img-link"})
+            image_link = image.get("href") if image else None
+            if author_id == 0:
+                text_node = parser.find(
+                    "div", {"class": "alert alert-with-icon alert-info"}
+                )
+            else:
+                text_node = parser.find("div", {"class": "message-text"})
+            message_text = text_node.get_text(strip=True) if text_node else None
+
+            # FunPay sometimes includes separators/widgets in the messages array.
+            # They are not user messages and must not break the whole history.
+            if message_text is None and image_link is None:
+                continue
+
+            by_bot = False
+            if message_text and message_text.startswith(account.bot_character):
+                message_text = message_text.removeprefix(account.bot_character)
+                by_bot = True
+
+            if author_id == 0:
+                author = "FunPay"
+            elif author_id == account.id:
+                author = account.username
+            else:
+                author = chat_name
+            author_node = parser.find("div", {"class": "media-user-name"})
+            if author_node is not None:
+                author_link = author_node.find("a")
+                parsed_author = (author_link or author_node).get_text(strip=True)
+                author = parsed_author or author
+
+            message = types.Message(
+                message_id,
+                message_text,
+                chat_id,
+                chat_name,
+                author,
+                author_id,
+                message_html,
+                image_link,
+                determine_msg_type=False,
+            )
+            message.by_bot = by_bot
+            message.type = (
+                enums.MessageTypes.NON_SYSTEM
+                if author_id != 0
+                else message.get_message_type()
+            )
+            messages.append(message)
+        return messages
+
+    @classmethod
+    def _chat_history(
+        cls, account: Account, chat_id: int | str, chat_name: str | None
+    ) -> list[Any]:
+        """Get history with retries for proxies and a parser-bug fallback."""
+
+        normalized_chat_id: int | str = chat_id
+        if isinstance(normalized_chat_id, str) and normalized_chat_id.isdigit():
+            normalized_chat_id = int(normalized_chat_id)
+
+        for attempt in range(3):
+            try:
+                try:
+                    return account.get_chat_history(
+                        normalized_chat_id, interlocutor_username=chat_name
+                    )
+                except AttributeError:
+                    return cls._parse_chat_history_fallback(
+                        account, normalized_chat_id, chat_name
+                    )
+            except UnauthorizedError:
+                raise
+            except RequestFailedError as error:
+                if attempt == 2 or error.status_code not in (
+                    {400} | TRANSIENT_HTTP_STATUSES
+                ):
+                    raise
+                if error.status_code == 400:
+                    account.get(update_phpsessid=True)
+                time.sleep(0.75 * (attempt + 1))
+            except requests.RequestException:
+                if attempt == 2:
+                    raise
+                time.sleep(0.75 * (attempt + 1))
+        return []
+
     async def latest_message(
         self, account: Account, chat_id: int | str, chat_name: str | None
     ) -> Any | None:
         def request() -> Any | None:
-            normalized_chat_id: int | str = chat_id
-            if isinstance(normalized_chat_id, str) and normalized_chat_id.isdigit():
-                normalized_chat_id = int(normalized_chat_id)
-            messages = account.get_chat_history(
-                normalized_chat_id, interlocutor_username=chat_name
-            )
+            messages = self._chat_history(account, chat_id, chat_name)
             return messages[-1] if messages else None
 
         return await self._thread(request)
 
     async def is_first_client_message(self, account: Account, message: Any) -> bool:
         def request() -> bool:
-            chat_id: int | str = message.chat_id
-            if isinstance(chat_id, str) and chat_id.isdigit():
-                chat_id = int(chat_id)
-            history = account.get_chat_history(
-                chat_id, interlocutor_username=message.chat_name
-            )
+            history = self._chat_history(account, message.chat_id, message.chat_name)
             client_messages = [
                 item
                 for item in history
@@ -345,11 +448,17 @@ class FunPayService:
                     if chat.id in histories:
                         continue
                     try:
-                        histories[chat.id] = account.get_chat_history(
-                            chat.id, interlocutor_username=chat.name
+                        histories[chat.id] = self._chat_history(
+                            account, chat.id, chat.name
                         )
                     except UnauthorizedError:
                         raise
+                    except requests.RequestException as error:
+                        logger.warning(
+                            "FunPay chat %s is temporarily unavailable through proxy: %s",
+                            chat.id,
+                            type(error).__name__,
+                        )
                     except Exception:
                         logger.exception("Failed to fetch FunPay chat %s", chat.id)
 
