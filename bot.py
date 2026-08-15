@@ -50,6 +50,10 @@ class Greeting(StatesGroup):
     waiting_text = State()
 
 
+class UserAgentSetup(StatesGroup):
+    waiting_value = State()
+
+
 class LotEdit(StatesGroup):
     waiting_value = State()
 
@@ -136,6 +140,12 @@ def notifications_keyboard(row) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🌐 Указать User-Agent",
+                    callback_data="notifications:user_agent",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="🔄 Обновить статус", callback_data="notifications"
                 )
             ],
@@ -194,6 +204,7 @@ def notifications_text(row) -> str:
         "🔔 <b>Уведомления FunPay</b>\n\n"
         f"Новые сообщения: <b>{'включены' if row['message_notifications_enabled'] else 'выключены'}</b>\n"
         f"Новые заказы: <b>{'включены' if row['order_notifications_enabled'] else 'выключены'}</b>\n"
+        f"User-Agent: <b>{'сохранён' if row['funpay_user_agent'] else 'автоматический'}</b>\n"
         f"Мониторинг: <b>{monitor_status}</b>\n\n"
         "В уведомлении о сообщении показывается ник собеседника и кнопка быстрого ответа."
     )
@@ -345,7 +356,11 @@ async def load_account(
     credentials = await read_credentials(telegram_id, database, cipher)
     if not credentials:
         raise StoredSecretError("Аккаунт ещё не подключён.")
-    return await funpay.account(credentials.golden_key, credentials.proxy_url)
+    return await funpay.account(
+        credentials.golden_key,
+        credentials.proxy_url,
+        credentials.user_agent,
+    )
 
 
 async def report_funpay_error(
@@ -895,6 +910,68 @@ async def callback_check_notifications(
         )
         await report_funpay_error(
             callback.message, callback.from_user.id, error, database, state
+        )
+
+
+@router.callback_query(F.data == "notifications:user_agent")
+async def callback_user_agent(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(UserAgentSetup.waiting_value)
+    await callback.answer()
+    await callback.message.answer(
+        "🌐 <b>User-Agent браузера FunPay</b>\n\n"
+        "Документация FunPayAPI требует User-Agent того браузера, в котором был получен GOLDEN_KEY. "
+        "Откройте в этом браузере "
+        "<a href=\"https://www.whatismybrowser.com/detect/what-is-my-user-agent/\">страницу определения User-Agent</a>, "
+        "скопируйте всю строку "
+        "начиная с <code>Mozilla/5.0</code> и отправьте сюда."
+    )
+
+
+@router.message(UserAgentSetup.waiting_value, F.text)
+async def receive_user_agent(
+    message: Message,
+    state: FSMContext,
+    database: Database,
+    cipher: SecretCipher,
+    funpay: FunPayService,
+) -> None:
+    user_agent = message.text.strip()
+    if (
+        not user_agent.startswith("Mozilla/5.0")
+        or len(user_agent) > 1000
+        or "\n" in user_agent
+    ):
+        await message.answer(
+            "❌ Нужна полная строка User-Agent, начинающаяся с <code>Mozilla/5.0</code>."
+        )
+        return
+
+    status = await message.answer("⏳ Проверяю User-Agent через мониторинг FunPay…")
+    try:
+        credentials = await read_credentials(message.from_user.id, database, cipher)
+        if not credentials:
+            raise StoredSecretError("Аккаунт ещё не подключён.")
+        account = await funpay.account(
+            credentials.golden_key,
+            credentials.proxy_url,
+            user_agent,
+        )
+        chats, _ = await funpay.chat_histories(account)
+        await database.set_user_agent(message.from_user.id, user_agent)
+        await database.mark_monitor_success(message.from_user.id)
+        await state.clear()
+        row = await database.get_user(message.from_user.id)
+        await status.edit_text(
+            notifications_text(row)
+            + f"\n\n✅ User-Agent принят. FunPay вернул чатов: <b>{len(chats)}</b>.",
+            reply_markup=notifications_keyboard(row),
+        )
+    except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
+        await database.mark_monitor_error(
+            message.from_user.id, monitor_error_label("User-Agent", error)
+        )
+        await report_funpay_error(
+            message, message.from_user.id, error, database, state
         )
 
 
