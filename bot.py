@@ -1,13 +1,9 @@
 import asyncio
-import base64
-import hashlib
 import html
 import logging
 import os
-from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timedelta, timezone
 
-import asyncpg
 import requests
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -17,13 +13,23 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from cryptography.fernet import Fernet, InvalidToken
-from FunPayAPI import Account
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from FunPayAPI.common.exceptions import RequestFailedError, UnauthorizedError
 
-from proxy_utils import ProxyFormatError, normalize_proxy, proxy_mapping
-
+from funpay_service import (
+    BalanceUnavailableError,
+    FunPayService,
+    NotificationManager,
+    RaiseOutcome,
+    next_raise_delay,
+)
+from proxy_utils import ProxyFormatError, normalize_proxy
+from storage import Database, SecretCipher, StoredSecretError, read_credentials
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -35,180 +41,16 @@ class Setup(StatesGroup):
     waiting_golden_key = State()
 
 
+class Reply(StatesGroup):
+    waiting_text = State()
+
+
 class ConfigurationError(RuntimeError):
     pass
 
 
-class StoredSecretError(RuntimeError):
-    pass
-
-
-class SecretCipher:
-    """Encrypts stored credentials without requiring a third environment variable."""
-
-    def __init__(self, bot_token: str):
-        digest = hashlib.sha256(f"funpay-telegram-bot:v1:{bot_token}".encode()).digest()
-        self._fernet = Fernet(base64.urlsafe_b64encode(digest))
-
-    def encrypt(self, value: str) -> str:
-        return self._fernet.encrypt(value.encode()).decode()
-
-    def decrypt(self, value: str) -> str:
-        try:
-            return self._fernet.decrypt(value.encode()).decode()
-        except (InvalidToken, ValueError) as error:
-            raise StoredSecretError("Не удалось расшифровать сохранённые данные.") from error
-
-
-class Database:
-    def __init__(self, dsn: str):
-        self.dsn = dsn
-        self.pool: asyncpg.Pool | None = None
-
-    async def connect(self) -> None:
-        self.pool = await asyncpg.create_pool(
-            dsn=self.dsn,
-            min_size=1,
-            max_size=5,
-            command_timeout=20,
-        )
-
-    async def close(self) -> None:
-        if self.pool:
-            await self.pool.close()
-
-    def _pool(self) -> asyncpg.Pool:
-        if not self.pool:
-            raise RuntimeError("Database is not connected")
-        return self.pool
-
-    async def init(self) -> None:
-        await self._pool().execute(
-            """
-            CREATE TABLE IF NOT EXISTS funpay_bot_users (
-                telegram_id BIGINT PRIMARY KEY,
-                telegram_username TEXT,
-                encrypted_proxy TEXT,
-                encrypted_golden_key TEXT,
-                funpay_user_id BIGINT,
-                funpay_username TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
-        )
-
-    async def get_user(self, telegram_id: int) -> asyncpg.Record | None:
-        return await self._pool().fetchrow(
-            "SELECT * FROM funpay_bot_users WHERE telegram_id = $1", telegram_id
-        )
-
-    async def save_proxy(self, telegram_id: int, username: str | None, encrypted_proxy: str) -> None:
-        await self._pool().execute(
-            """
-            INSERT INTO funpay_bot_users (
-                telegram_id, telegram_username, encrypted_proxy, encrypted_golden_key,
-                funpay_user_id, funpay_username
-            ) VALUES ($1, $2, $3, NULL, NULL, NULL)
-            ON CONFLICT (telegram_id) DO UPDATE SET
-                telegram_username = EXCLUDED.telegram_username,
-                encrypted_proxy = EXCLUDED.encrypted_proxy,
-                encrypted_golden_key = NULL,
-                funpay_user_id = NULL,
-                funpay_username = NULL,
-                updated_at = NOW()
-            """,
-            telegram_id,
-            username,
-            encrypted_proxy,
-        )
-
-    async def save_account(
-        self,
-        telegram_id: int,
-        username: str | None,
-        encrypted_golden_key: str,
-        funpay_user_id: int,
-        funpay_username: str,
-    ) -> None:
-        await self._pool().execute(
-            """
-            UPDATE funpay_bot_users SET
-                telegram_username = $2,
-                encrypted_golden_key = $3,
-                funpay_user_id = $4,
-                funpay_username = $5,
-                updated_at = NOW()
-            WHERE telegram_id = $1
-            """,
-            telegram_id,
-            username,
-            encrypted_golden_key,
-            funpay_user_id,
-            funpay_username,
-        )
-
-    async def clear_key(self, telegram_id: int) -> None:
-        await self._pool().execute(
-            """
-            UPDATE funpay_bot_users SET
-                encrypted_golden_key = NULL,
-                funpay_user_id = NULL,
-                funpay_username = NULL,
-                updated_at = NOW()
-            WHERE telegram_id = $1
-            """,
-            telegram_id,
-        )
-
-    async def delete_user(self, telegram_id: int) -> None:
-        await self._pool().execute(
-            "DELETE FROM funpay_bot_users WHERE telegram_id = $1", telegram_id
-        )
-
-
-@dataclass(slots=True)
-class StoredCredentials:
-    proxy_url: str
-    golden_key: str
-
-
-class FunPayService:
-    def __init__(self, concurrency: int = 8):
-        self._semaphore = asyncio.Semaphore(concurrency)
-
-    async def check_proxy(self, proxy_url: str) -> None:
-        def request() -> None:
-            response = requests.get(
-                "https://funpay.com/",
-                proxies=proxy_mapping(proxy_url),
-                timeout=12,
-                allow_redirects=True,
-            )
-            if response.status_code == 407 or response.status_code >= 500:
-                raise requests.RequestException(f"HTTP {response.status_code}")
-
-        async with self._semaphore:
-            await asyncio.to_thread(request)
-
-    async def account(self, golden_key: str, proxy_url: str) -> Account:
-        def request() -> Account:
-            return Account(
-                golden_key,
-                requests_timeout=15,
-                proxy=proxy_mapping(proxy_url),
-            ).get()
-
-        async with self._semaphore:
-            return await asyncio.to_thread(request)
-
-    async def profile(self, account: Account) -> Any:
-        async with self._semaphore:
-            return await asyncio.to_thread(account.get_user, account.id)
-
-    async def balance(self, account: Account) -> Any:
-        async with self._semaphore:
-            return await asyncio.to_thread(account.get_balance)
+def status_icon(enabled: bool) -> str:
+    return "✅" if enabled else "❌"
 
 
 def menu_keyboard() -> InlineKeyboardMarkup:
@@ -219,7 +61,17 @@ def menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
             ],
             [InlineKeyboardButton(text="📋 Мои объявления", callback_data="lots:0")],
-            [InlineKeyboardButton(text="🔄 Сменить аккаунт / прокси", callback_data="reconnect")],
+            [
+                InlineKeyboardButton(
+                    text="🔔 Уведомления", callback_data="notifications"
+                ),
+                InlineKeyboardButton(text="⬆️ Автоподнятие", callback_data="autoraise"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Сменить аккаунт / прокси", callback_data="reconnect"
+                )
+            ],
         ]
     )
 
@@ -227,12 +79,93 @@ def menu_keyboard() -> InlineKeyboardMarkup:
 def lots_keyboard(page: int, pages: int) -> InlineKeyboardMarkup:
     navigation: list[InlineKeyboardButton] = []
     if page > 0:
-        navigation.append(InlineKeyboardButton(text="⬅️", callback_data=f"lots:{page - 1}"))
-    navigation.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
+        navigation.append(
+            InlineKeyboardButton(text="⬅️", callback_data=f"lots:{page - 1}")
+        )
+    navigation.append(
+        InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop")
+    )
     if page + 1 < pages:
-        navigation.append(InlineKeyboardButton(text="➡️", callback_data=f"lots:{page + 1}"))
+        navigation.append(
+            InlineKeyboardButton(text="➡️", callback_data=f"lots:{page + 1}")
+        )
     return InlineKeyboardMarkup(
-        inline_keyboard=[navigation, [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")]]
+        inline_keyboard=[
+            navigation,
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
+        ]
+    )
+
+
+def notifications_keyboard(row) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"{status_icon(row['message_notifications_enabled'])} Новые сообщения",
+                    callback_data="notify:messages",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"{status_icon(row['order_notifications_enabled'])} Новые заказы",
+                    callback_data="notify:orders",
+                )
+            ],
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
+        ]
+    )
+
+
+def autoraise_keyboard(row) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"{status_icon(row['auto_raise_enabled'])} Автоподнятие",
+                    callback_data="autoraise:toggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"{status_icon(row['raise_notifications_enabled'])} Уведомлять о поднятии",
+                    callback_data="autoraise:notify",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬆️ Поднять сейчас", callback_data="autoraise:now"
+                )
+            ],
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
+        ]
+    )
+
+
+def notifications_text(row) -> str:
+    return (
+        "🔔 <b>Уведомления FunPay</b>\n\n"
+        f"Новые сообщения: <b>{'включены' if row['message_notifications_enabled'] else 'выключены'}</b>\n"
+        f"Новые заказы: <b>{'включены' if row['order_notifications_enabled'] else 'выключены'}</b>\n\n"
+        "В уведомлении о сообщении показывается ник собеседника и кнопка быстрого ответа."
+    )
+
+
+def autoraise_text(row) -> str:
+    next_raise = row["next_raise_at"]
+    if row["auto_raise_enabled"] and next_raise:
+        next_text = next_raise.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    elif row["auto_raise_enabled"]:
+        next_text = "при ближайшей проверке"
+    else:
+        next_text = "—"
+    return (
+        "⬆️ <b>Автоподнятие лотов</b>\n\n"
+        f"Автоподнятие: <b>{'включено' if row['auto_raise_enabled'] else 'выключено'}</b>\n"
+        f"Уведомления о поднятии: <b>{'включены' if row['raise_notifications_enabled'] else 'выключены'}</b>\n"
+        f"Следующая попытка: <b>{next_text}</b>\n\n"
+        "Поднимаются стандартные лоты во всех найденных категориях. "
+        "Если FunPay вернёт таймер ожидания, следующая попытка будет назначена по нему."
     )
 
 
@@ -259,45 +192,45 @@ async def prompt_proxy(message: Message, state: FSMContext) -> None:
 async def show_menu(message: Message, username: str | None = None) -> None:
     greeting = f", <b>{html.escape(username)}</b>" if username else ""
     await message.answer(
-        f"✅ FunPay подключён{greeting}. Выберите действие:", reply_markup=menu_keyboard()
-    )
-
-
-async def read_credentials(
-    telegram_id: int, db: Database, cipher: SecretCipher
-) -> StoredCredentials | None:
-    row = await db.get_user(telegram_id)
-    if not row or not row["encrypted_proxy"] or not row["encrypted_golden_key"]:
-        return None
-    return StoredCredentials(
-        proxy_url=cipher.decrypt(row["encrypted_proxy"]),
-        golden_key=cipher.decrypt(row["encrypted_golden_key"]),
+        f"✅ FunPay подключён{greeting}. Выберите действие:",
+        reply_markup=menu_keyboard(),
     )
 
 
 async def load_account(
-    telegram_id: int, db: Database, cipher: SecretCipher, funpay: FunPayService
-) -> Account:
-    credentials = await read_credentials(telegram_id, db, cipher)
+    telegram_id: int, database: Database, cipher: SecretCipher, funpay: FunPayService
+):
+    credentials = await read_credentials(telegram_id, database, cipher)
     if not credentials:
         raise StoredSecretError("Аккаунт ещё не подключён.")
     return await funpay.account(credentials.golden_key, credentials.proxy_url)
 
 
 async def report_funpay_error(
-    target: Message, telegram_id: int, error: Exception, db: Database, state: FSMContext | None = None
+    target: Message,
+    telegram_id: int,
+    error: Exception,
+    database: Database,
+    state: FSMContext | None = None,
 ) -> None:
     if isinstance(error, UnauthorizedError):
-        await db.clear_key(telegram_id)
+        await database.clear_key(telegram_id)
         if state:
             await state.set_state(Setup.waiting_golden_key)
         await target.answer(
-            "❌ GOLDEN_KEY недействителен или сессия FunPay завершена. "
-            "Отправьте новый GOLDEN_KEY."
+            "❌ GOLDEN_KEY недействителен или сессия FunPay завершена. Отправьте новый GOLDEN_KEY."
+        )
+        return
+    if isinstance(error, BalanceUnavailableError):
+        await target.answer(
+            "❌ FunPay открыл профиль, но не отдал блок баланса. "
+            "Попробуйте создать или активировать хотя бы одно объявление и повторить проверку."
         )
         return
     if isinstance(error, StoredSecretError):
-        await target.answer(f"❌ {html.escape(str(error))} Используйте /reset для переподключения.")
+        await target.answer(
+            f"❌ {html.escape(str(error))} Используйте /reset для переподключения."
+        )
         return
     if isinstance(error, (requests.RequestException, RequestFailedError, TimeoutError)):
         await target.answer(
@@ -305,13 +238,33 @@ async def report_funpay_error(
         )
         return
     logger.exception("Unexpected FunPay request failure", exc_info=error)
-    await target.answer("❌ Не удалось получить данные FunPay. Попробуйте ещё раз позже.")
+    await target.answer(
+        "❌ Не удалось получить данные FunPay. Попробуйте ещё раз позже."
+    )
+
+
+def format_raise_results(outcomes: list[RaiseOutcome]) -> str:
+    if not outcomes:
+        return "📭 Стандартные лоты для поднятия не найдены. Валютные лоты FunPay поднимать не позволяет."
+    lines = ["⬆️ <b>Результат поднятия</b>\n"]
+    for item in outcomes:
+        name = html.escape(item.category_name)
+        if item.raised:
+            lines.append(f"✅ {name}: подняты")
+        elif item.wait_seconds:
+            minutes = max(1, (item.wait_seconds + 59) // 60)
+            lines.append(f"⏳ {name}: повтор через ~{minutes} мин.")
+        else:
+            lines.append(f"❌ {name}: не удалось поднять")
+    return "\n".join(lines)
 
 
 @router.message(CommandStart())
-async def command_start(message: Message, state: FSMContext, db: Database) -> None:
+async def command_start(
+    message: Message, state: FSMContext, database: Database
+) -> None:
     await state.clear()
-    row = await db.get_user(message.from_user.id)
+    row = await database.get_user(message.from_user.id)
     if row and row["encrypted_proxy"] and row["encrypted_golden_key"]:
         await show_menu(message, row["funpay_username"])
     elif row and row["encrypted_proxy"]:
@@ -325,10 +278,12 @@ async def command_start(message: Message, state: FSMContext, db: Database) -> No
 
 
 @router.message(Command("reset"))
-async def command_reset(message: Message, state: FSMContext, db: Database) -> None:
-    await db.delete_user(message.from_user.id)
+async def command_reset(
+    message: Message, state: FSMContext, database: Database
+) -> None:
+    await database.delete_user(message.from_user.id)
     await state.clear()
-    await message.answer("Сохранённое подключение удалено.")
+    await message.answer("Сохранённое подключение и настройки удалены.")
     await prompt_proxy(message, state)
 
 
@@ -336,7 +291,7 @@ async def command_reset(message: Message, state: FSMContext, db: Database) -> No
 async def receive_proxy(
     message: Message,
     state: FSMContext,
-    db: Database,
+    database: Database,
     cipher: SecretCipher,
     funpay: FunPayService,
 ) -> None:
@@ -347,7 +302,9 @@ async def receive_proxy(
         proxy_url = normalize_proxy(raw_proxy)
         await funpay.check_proxy(proxy_url)
     except ProxyFormatError as error:
-        await status.edit_text(f"❌ {html.escape(str(error))}\n\nОтправьте прокси ещё раз.")
+        await status.edit_text(
+            f"❌ {html.escape(str(error))}\n\nОтправьте прокси ещё раз."
+        )
         return
     except (requests.RequestException, asyncio.TimeoutError):
         await status.edit_text(
@@ -355,10 +312,8 @@ async def receive_proxy(
         )
         return
 
-    await db.save_proxy(
-        message.from_user.id,
-        message.from_user.username,
-        cipher.encrypt(proxy_url),
+    await database.save_proxy(
+        message.from_user.id, message.from_user.username, cipher.encrypt(proxy_url)
     )
     await state.set_state(Setup.waiting_golden_key)
     await status.edit_text(
@@ -373,7 +328,7 @@ async def receive_proxy(
 async def receive_golden_key(
     message: Message,
     state: FSMContext,
-    db: Database,
+    database: Database,
     cipher: SecretCipher,
     funpay: FunPayService,
 ) -> None:
@@ -381,10 +336,12 @@ async def receive_golden_key(
     await delete_sensitive_message(message)
     status = await message.answer("⏳ Проверяю GOLDEN_KEY…")
     if not 16 <= len(golden_key) <= 512 or any(char.isspace() for char in golden_key):
-        await status.edit_text("❌ GOLDEN_KEY выглядит некорректно. Отправьте ключ ещё раз.")
+        await status.edit_text(
+            "❌ GOLDEN_KEY выглядит некорректно. Отправьте ключ ещё раз."
+        )
         return
 
-    row = await db.get_user(message.from_user.id)
+    row = await database.get_user(message.from_user.id)
     if not row or not row["encrypted_proxy"]:
         await status.edit_text("Сначала нужно добавить прокси. Используйте /reset.")
         await state.clear()
@@ -394,7 +351,9 @@ async def receive_golden_key(
         proxy_url = cipher.decrypt(row["encrypted_proxy"])
         account = await funpay.account(golden_key, proxy_url)
     except UnauthorizedError:
-        await status.edit_text("❌ FunPay отклонил GOLDEN_KEY. Проверьте ключ и отправьте его ещё раз.")
+        await status.edit_text(
+            "❌ FunPay отклонил GOLDEN_KEY. Проверьте ключ и отправьте его ещё раз."
+        )
         return
     except (requests.RequestException, RequestFailedError, StoredSecretError):
         await status.edit_text(
@@ -403,10 +362,12 @@ async def receive_golden_key(
         return
     except Exception as error:
         logger.exception("Golden key validation failed", exc_info=error)
-        await status.edit_text("❌ Не удалось проверить аккаунт. Попробуйте ещё раз позже.")
+        await status.edit_text(
+            "❌ Не удалось проверить аккаунт. Попробуйте ещё раз позже."
+        )
         return
 
-    await db.save_account(
+    await database.save_account(
         message.from_user.id,
         message.from_user.username,
         cipher.encrypt(golden_key),
@@ -415,15 +376,19 @@ async def receive_golden_key(
     )
     await state.clear()
     await status.edit_text(
-        f"✅ Аккаунт <b>{html.escape(account.username)}</b> подключён.",
+        f"✅ Аккаунт <b>{html.escape(account.username)}</b> подключён. "
+        "Уведомления о новых сообщениях и заказах включены.",
         reply_markup=menu_keyboard(),
     )
 
 
 @router.callback_query(F.data == "menu")
-async def callback_menu(callback: CallbackQuery, db: Database) -> None:
+async def callback_menu(
+    callback: CallbackQuery, state: FSMContext, database: Database
+) -> None:
     await callback.answer()
-    row = await db.get_user(callback.from_user.id)
+    await state.clear()
+    row = await database.get_user(callback.from_user.id)
     username = row["funpay_username"] if row else None
     await callback.message.edit_text(
         f"✅ FunPay подключён{f', <b>{html.escape(username)}</b>' if username else ''}. "
@@ -438,9 +403,11 @@ async def callback_noop(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "reconnect")
-async def callback_reconnect(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+async def callback_reconnect(
+    callback: CallbackQuery, state: FSMContext, database: Database
+) -> None:
     await callback.answer()
-    await db.delete_user(callback.from_user.id)
+    await database.delete_user(callback.from_user.id)
     await state.clear()
     await prompt_proxy(callback.message, state)
 
@@ -449,14 +416,14 @@ async def callback_reconnect(callback: CallbackQuery, state: FSMContext, db: Dat
 async def callback_balance(
     callback: CallbackQuery,
     state: FSMContext,
-    db: Database,
+    database: Database,
     cipher: SecretCipher,
     funpay: FunPayService,
 ) -> None:
     await callback.answer("Получаю баланс…")
     await callback.bot.send_chat_action(callback.message.chat.id, ChatAction.TYPING)
     try:
-        account = await load_account(callback.from_user.id, db, cipher, funpay)
+        account = await load_account(callback.from_user.id, database, cipher, funpay)
         balance = await funpay.balance(account)
         text = (
             "💰 <b>Баланс FunPay</b>\n\n"
@@ -468,22 +435,24 @@ async def callback_balance(
             f"(доступно €{balance.available_eur:,.2f})"
         )
         await callback.message.answer(text, reply_markup=menu_keyboard())
-    except Exception as error:
-        await report_funpay_error(callback.message, callback.from_user.id, error, db, state)
+    except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
+        await report_funpay_error(
+            callback.message, callback.from_user.id, error, database, state
+        )
 
 
 @router.callback_query(F.data == "profile")
 async def callback_profile(
     callback: CallbackQuery,
     state: FSMContext,
-    db: Database,
+    database: Database,
     cipher: SecretCipher,
     funpay: FunPayService,
 ) -> None:
     await callback.answer("Получаю профиль…")
     await callback.bot.send_chat_action(callback.message.chat.id, ChatAction.TYPING)
     try:
-        account = await load_account(callback.from_user.id, db, cipher, funpay)
+        account = await load_account(callback.from_user.id, database, cipher, funpay)
         profile = await funpay.profile(account)
         lots_count = len(profile.get_lots())
         text = (
@@ -495,19 +464,23 @@ async def callback_profile(
             f"Активные продажи: <b>{account.active_sales}</b>\n"
             f"Активные покупки: <b>{account.active_purchases}</b>\n"
             f"Объявлений: <b>{lots_count}</b>\n"
-            f"Фото: <a href=\"{html.escape(profile.profile_photo, quote=True)}\">открыть</a>\n"
-            f"Профиль: <a href=\"https://funpay.com/users/{profile.id}/\">FunPay</a>"
+            f'Фото: <a href="{html.escape(profile.profile_photo, quote=True)}">открыть</a>\n'
+            f'Профиль: <a href="https://funpay.com/users/{profile.id}/">FunPay</a>'
         )
-        await callback.message.answer(text, reply_markup=menu_keyboard(), disable_web_page_preview=True)
-    except Exception as error:
-        await report_funpay_error(callback.message, callback.from_user.id, error, db, state)
+        await callback.message.answer(
+            text, reply_markup=menu_keyboard(), disable_web_page_preview=True
+        )
+    except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
+        await report_funpay_error(
+            callback.message, callback.from_user.id, error, database, state
+        )
 
 
 @router.callback_query(F.data.startswith("lots:"))
 async def callback_lots(
     callback: CallbackQuery,
     state: FSMContext,
-    db: Database,
+    database: Database,
     cipher: SecretCipher,
     funpay: FunPayService,
 ) -> None:
@@ -519,18 +492,27 @@ async def callback_lots(
     await callback.bot.send_chat_action(callback.message.chat.id, ChatAction.TYPING)
 
     try:
-        account = await load_account(callback.from_user.id, db, cipher, funpay)
+        account = await load_account(callback.from_user.id, database, cipher, funpay)
         profile = await funpay.profile(account)
         lots = profile.get_lots()
         if not lots:
-            await callback.message.answer("📭 У аккаунта нет опубликованных объявлений.", reply_markup=menu_keyboard())
+            await callback.message.answer(
+                "📭 У аккаунта нет опубликованных объявлений.",
+                reply_markup=menu_keyboard(),
+            )
             return
 
         pages = (len(lots) + PAGE_SIZE - 1) // PAGE_SIZE
         page = min(requested_page, pages - 1)
-        chunks = [f"📋 <b>Объявления {html.escape(profile.username)}</b> — {len(lots)} шт.\n"]
-        for index, lot in enumerate(lots[page * PAGE_SIZE:(page + 1) * PAGE_SIZE], start=page * PAGE_SIZE + 1):
-            category = getattr(getattr(lot, "subcategory", None), "fullname", "Без категории")
+        chunks = [
+            f"📋 <b>Объявления {html.escape(profile.username)}</b> — {len(lots)} шт.\n"
+        ]
+        for index, lot in enumerate(
+            lots[page * PAGE_SIZE : (page + 1) * PAGE_SIZE], start=page * PAGE_SIZE + 1
+        ):
+            category = getattr(
+                getattr(lot, "subcategory", None), "fullname", "Без категории"
+            )
             description = (lot.description or "Без названия").strip()
             if len(description) > 180:
                 description = description[:177] + "…"
@@ -539,29 +521,207 @@ async def callback_lots(
                 f"\n<b>{index}. {html.escape(description)}</b>\n"
                 f"{html.escape(category)}{server}\n"
                 f"Цена: <b>{lot.price:,.2f} ₽</b> · "
-                f"<a href=\"{html.escape(lot.public_link, quote=True)}\">открыть</a>"
+                f'<a href="{html.escape(lot.public_link, quote=True)}">открыть</a>'
             )
         text = "\n".join(chunks)
         keyboard = lots_keyboard(page, pages)
         if callback.message.text and callback.message.text.startswith("📋"):
-            await callback.message.edit_text(text, reply_markup=keyboard, disable_web_page_preview=True)
+            await callback.message.edit_text(
+                text, reply_markup=keyboard, disable_web_page_preview=True
+            )
         else:
-            await callback.message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
-    except Exception as error:
-        await report_funpay_error(callback.message, callback.from_user.id, error, db, state)
+            await callback.message.answer(
+                text, reply_markup=keyboard, disable_web_page_preview=True
+            )
+    except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
+        await report_funpay_error(
+            callback.message, callback.from_user.id, error, database, state
+        )
+
+
+@router.callback_query(F.data == "notifications")
+async def callback_notifications(callback: CallbackQuery, database: Database) -> None:
+    await callback.answer()
+    row = await database.get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        notifications_text(row), reply_markup=notifications_keyboard(row)
+    )
+
+
+@router.callback_query(F.data.startswith("notify:"))
+async def callback_toggle_notification(
+    callback: CallbackQuery, database: Database
+) -> None:
+    await callback.answer()
+    row = await database.get_user(callback.from_user.id)
+    setting = (
+        "message_notifications_enabled"
+        if callback.data == "notify:messages"
+        else "order_notifications_enabled"
+    )
+    await database.set_setting(callback.from_user.id, setting, not row[setting])
+    row = await database.get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        notifications_text(row), reply_markup=notifications_keyboard(row)
+    )
+
+
+@router.callback_query(F.data == "autoraise")
+async def callback_autoraise(callback: CallbackQuery, database: Database) -> None:
+    await callback.answer()
+    row = await database.get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        autoraise_text(row), reply_markup=autoraise_keyboard(row)
+    )
+
+
+@router.callback_query(F.data == "autoraise:toggle")
+async def callback_toggle_autoraise(
+    callback: CallbackQuery, database: Database
+) -> None:
+    row = await database.get_user(callback.from_user.id)
+    enabled = not row["auto_raise_enabled"]
+    await database.set_setting(callback.from_user.id, "auto_raise_enabled", enabled)
+    await callback.answer(
+        "Автоподнятие включено" if enabled else "Автоподнятие выключено"
+    )
+    row = await database.get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        autoraise_text(row), reply_markup=autoraise_keyboard(row)
+    )
+
+
+@router.callback_query(F.data == "autoraise:notify")
+async def callback_toggle_raise_notifications(
+    callback: CallbackQuery, database: Database
+) -> None:
+    row = await database.get_user(callback.from_user.id)
+    enabled = not row["raise_notifications_enabled"]
+    await database.set_setting(
+        callback.from_user.id, "raise_notifications_enabled", enabled
+    )
+    await callback.answer(
+        "Уведомления включены" if enabled else "Уведомления выключены"
+    )
+    row = await database.get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        autoraise_text(row), reply_markup=autoraise_keyboard(row)
+    )
+
+
+@router.callback_query(F.data == "autoraise:now")
+async def callback_raise_now(
+    callback: CallbackQuery,
+    state: FSMContext,
+    database: Database,
+    cipher: SecretCipher,
+    funpay: FunPayService,
+) -> None:
+    await callback.answer("Поднимаю лоты…")
+    await callback.bot.send_chat_action(callback.message.chat.id, ChatAction.TYPING)
+    try:
+        account = await load_account(callback.from_user.id, database, cipher, funpay)
+        outcomes = await funpay.raise_all(account)
+        delay = next_raise_delay(outcomes)
+        await database.set_next_raise(
+            callback.from_user.id,
+            datetime.now(timezone.utc) + timedelta(seconds=delay),
+        )
+        await callback.message.answer(
+            format_raise_results(outcomes), reply_markup=menu_keyboard()
+        )
+    except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
+        await report_funpay_error(
+            callback.message, callback.from_user.id, error, database, state
+        )
+
+
+@router.callback_query(F.data.startswith("reply:"))
+async def callback_reply(
+    callback: CallbackQuery, state: FSMContext, database: Database
+) -> None:
+    chat_id = callback.data.split(":", 1)[1]
+    target = await database.get_chat_target(callback.from_user.id, chat_id)
+    username = target["interlocutor_username"] if target else "собеседнику"
+    await state.set_state(Reply.waiting_text)
+    await state.update_data(funpay_chat_id=chat_id, funpay_username=username)
+    await callback.answer()
+    await callback.message.answer(
+        f"✍️ Введите ответ для <b>{html.escape(username or 'собеседника')}</b>:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Отмена", callback_data="reply_cancel")]
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data == "reply_cancel")
+async def callback_reply_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer("Ответ отменён")
+    await callback.message.edit_text(
+        "Отправка ответа отменена.", reply_markup=menu_keyboard()
+    )
+
+
+@router.message(Reply.waiting_text, F.text)
+async def send_funpay_reply(
+    message: Message,
+    state: FSMContext,
+    database: Database,
+    cipher: SecretCipher,
+    funpay: FunPayService,
+) -> None:
+    reply_text = message.text.strip()
+    if not reply_text:
+        await message.answer("Ответ не может быть пустым.")
+        return
+    if len(reply_text) > 4000:
+        await message.answer("Ответ слишком длинный. Максимум — 4000 символов.")
+        return
+    data = await state.get_data()
+    chat_id = data.get("funpay_chat_id")
+    username = data.get("funpay_username")
+    if not chat_id:
+        await state.clear()
+        await message.answer(
+            "Контекст ответа потерян. Дождитесь нового сообщения FunPay."
+        )
+        return
+
+    status = await message.answer("⏳ Отправляю ответ в FunPay…")
+    try:
+        account = await load_account(message.from_user.id, database, cipher, funpay)
+        await funpay.send_message(account, chat_id, reply_text, username)
+        await state.clear()
+        await status.edit_text(
+            f"✅ Ответ для <b>{html.escape(username or 'собеседника')}</b> отправлен.",
+            reply_markup=menu_keyboard(),
+        )
+    except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
+        await report_funpay_error(message, message.from_user.id, error, database, state)
 
 
 @router.message()
 async def fallback(message: Message) -> None:
-    await message.answer("Используйте /start для открытия меню или /reset для переподключения.")
+    await message.answer(
+        "Используйте /start для открытия меню или /reset для переподключения."
+    )
 
 
 def required_environment() -> tuple[str, str]:
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     database_url = os.getenv("DATABASE_URL", "").strip()
-    missing = [name for name, value in (("BOT_TOKEN", bot_token), ("DATABASE_URL", database_url)) if not value]
+    missing = [
+        name
+        for name, value in (("BOT_TOKEN", bot_token), ("DATABASE_URL", database_url))
+        if not value
+    ]
     if missing:
-        raise ConfigurationError(f"Missing required environment variables: {', '.join(missing)}")
+        raise ConfigurationError(
+            f"Missing required environment variables: {', '.join(missing)}"
+        )
     return bot_token, database_url
 
 
@@ -576,17 +736,24 @@ async def main() -> None:
     dispatcher.include_router(router)
     cipher = SecretCipher(bot_token)
     funpay = FunPayService()
+    notifications = NotificationManager(bot, database, cipher, funpay)
+    background_task = asyncio.create_task(
+        notifications.run(), name="funpay-notifications"
+    )
 
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dispatcher.start_polling(
             bot,
-            db=database,
+            database=database,
             cipher=cipher,
             funpay=funpay,
             allowed_updates=dispatcher.resolve_used_update_types(),
         )
     finally:
+        notifications.stop()
+        background_task.cancel()
+        await asyncio.gather(background_task, return_exceptions=True)
         await database.close()
         await bot.session.close()
 

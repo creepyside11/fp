@@ -1,6 +1,5 @@
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-
 SUPPORTED_SCHEMES = {"http", "https", "socks4", "socks5", "socks5h"}
 
 
@@ -43,7 +42,9 @@ def normalize_proxy(value: str) -> str:
     if not 1 <= port <= 65535:
         raise ProxyFormatError("Порт прокси должен быть от 1 до 65535.")
     if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
-        raise ProxyFormatError("Прокси не должен содержать путь, параметры или фрагмент.")
+        raise ProxyFormatError(
+            "Прокси не должен содержать путь, параметры или фрагмент."
+        )
 
     hostname = parsed.hostname
     if ":" in hostname and not hostname.startswith("["):
