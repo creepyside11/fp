@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import html
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -11,13 +12,14 @@ import requests
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from bs4 import BeautifulSoup
 from FunPayAPI.common.exceptions import (
     RaiseError,
     RequestFailedError,
     UnauthorizedError,
 )
 
-from FunPayAPI import Account, Runner, enums
+from FunPayAPI import Account, Runner, enums, types
 from proxy_utils import proxy_mapping
 from storage import Database, SecretCipher, StoredSecretError
 
@@ -210,11 +212,51 @@ class FunPayService:
     async def save_lot(self, account: Account, lot_fields: Any) -> None:
         await self._thread(account.save_lot, lot_fields)
 
+    @staticmethod
+    def _runner_post(account: Account, objects: list[dict[str, Any]]) -> dict[str, Any]:
+        """Call FunPay runner with a lowercase false form value.
+
+        requests encodes Python ``False`` as ``False``. FunPay currently
+        validates this field as the lowercase form value ``false`` and may
+        otherwise return HTTP 400. Object booleans are inside JSON and are
+        already serialized correctly by json.dumps().
+        """
+        response = account.method(
+            "post",
+            "runner/",
+            {
+                "accept": "*/*",
+                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "x-requested-with": "XMLHttpRequest",
+            },
+            {
+                "objects": json.dumps(objects),
+                "request": "false",
+                "csrf_token": account.csrf_token,
+            },
+            raise_not_200=True,
+        )
+        return response.json()
+
     async def poll_events(self, runner: Runner) -> list[Any]:
         def request() -> list[Any]:
             for attempt in range(2):
                 try:
-                    return runner.parse_updates(runner.get_updates())
+                    order_tag = getattr(
+                        runner, "_Runner__last_order_event_tag", "00000000"
+                    )
+                    updates = self._runner_post(
+                        runner.account,
+                        [
+                            {
+                                "type": "orders_counters",
+                                "id": runner.account.id,
+                                "tag": order_tag,
+                                "data": False,
+                            }
+                        ],
+                    )
+                    return runner.parse_updates(updates)
                 except UnauthorizedError:
                     raise
                 except RequestFailedError as error:
@@ -231,10 +273,20 @@ class FunPayService:
         """Fetch current chats and their message IDs without relying on Runner events."""
 
         def request() -> tuple[list[Any], dict[int | str, list[Any]]]:
-            chats = []
+            chats_response: dict[str, Any] = {}
             for attempt in range(2):
                 try:
-                    chats = account.request_chats()
+                    chats_response = self._runner_post(
+                        account,
+                        [
+                            {
+                                "type": "chat_bookmarks",
+                                "id": account.id,
+                                "tag": "00000000",
+                                "data": False,
+                            }
+                        ],
+                    )
                     break
                 except UnauthorizedError:
                     raise
@@ -242,6 +294,32 @@ class FunPayService:
                     if error.status_code not in TRANSIENT_HTTP_STATUSES or attempt:
                         raise
                     time.sleep(2)
+
+            chats_html = ""
+            for item in chats_response.get("objects", []):
+                if item.get("type") != "chat_bookmarks" or not item.get("data"):
+                    continue
+                chats_html = item["data"].get("html", "")
+                break
+
+            chats: list[Any] = []
+            parser = BeautifulSoup(chats_html, "html.parser")
+            for element in parser.find_all("a", {"class": "contact-item"}):
+                message_element = element.find(
+                    "div", {"class": "contact-item-message"}
+                )
+                name_element = element.find("div", {"class": "media-user-name"})
+                if not message_element or not name_element:
+                    continue
+                chats.append(
+                    types.ChatShortcut(
+                        int(element["data-id"]),
+                        name_element.text.strip(),
+                        message_element.text,
+                        "unread" in element.get("class", []),
+                        str(element),
+                    )
+                )
 
             # New and recently active conversations are always at the top.
             # Ten histories fit into one runner request and avoid requesting
@@ -259,7 +337,39 @@ class FunPayService:
                 try:
                     for attempt in range(2):
                         try:
-                            histories.update(account.get_chats_histories(chat_names))
+                            objects = [
+                                {
+                                    "type": "chat_node",
+                                    "id": chat.id,
+                                    "tag": "00000000",
+                                    "data": {
+                                        "node": chat.id,
+                                        "last_message": -1,
+                                        "content": "",
+                                    },
+                                }
+                                for chat in batch
+                            ]
+                            history_response = self._runner_post(account, objects)
+                            for item in history_response.get("objects", []):
+                                chat_id = item.get("id")
+                                if not item.get("data"):
+                                    histories[chat_id] = []
+                                    continue
+                                parse_messages = account._Account__parse_messages
+                                if isinstance(chat_id, int):
+                                    node_name = item["data"]["node"]["name"]
+                                    interlocutor_id = int(node_name.split("-")[2])
+                                    interlocutor_name = chat_names.get(chat_id)
+                                else:
+                                    interlocutor_id = None
+                                    interlocutor_name = None
+                                histories[chat_id] = parse_messages(
+                                    item["data"]["messages"],
+                                    chat_id,
+                                    interlocutor_id,
+                                    interlocutor_name,
+                                )
                             break
                         except UnauthorizedError:
                             raise
