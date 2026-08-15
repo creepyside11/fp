@@ -102,6 +102,7 @@ class FakeDatabase:
         self.targets = []
         self.seen = set()
         self.greeted = set()
+        self.cursors = {}
 
     async def save_chat_target(self, telegram_id, chat_id, username):
         self.targets.append((telegram_id, chat_id, username))
@@ -123,12 +124,22 @@ class FakeDatabase:
     async def release_greeting(self, telegram_id, chat_id):
         self.greeted.discard((telegram_id, str(chat_id)))
 
+    async def get_chat_cursors(self, telegram_id):
+        return dict(self.cursors)
+
+    async def save_chat_cursors(self, telegram_id, cursors):
+        self.cursors.update({str(chat_id): value for chat_id, value in cursors.items()})
+
 
 class FakeFunPay:
-    def __init__(self, latest=None, first_client_message=False):
+    def __init__(
+        self, latest=None, first_client_message=False, chats=None, histories=None
+    ):
         self.latest = latest
         self.first_client_message = first_client_message
         self.replies = []
+        self.chats = chats or []
+        self.histories = histories or {}
 
     async def latest_message(self, account, chat_id, chat_name):
         return self.latest
@@ -139,8 +150,21 @@ class FakeFunPay:
     async def send_message(self, account, chat_id, text, chat_name):
         self.replies.append((chat_id, text, chat_name))
 
+    async def chat_histories(self, account):
+        return self.chats, self.histories
+
 
 class NotificationTests(unittest.TestCase):
+    @staticmethod
+    def row():
+        return {
+            "telegram_id": 99,
+            "message_notifications_enabled": True,
+            "order_notifications_enabled": True,
+            "greeting_enabled": False,
+            "greeting_text": "Hello",
+        }
+
     def test_message_notification_escapes_text_and_has_reply_target(self):
         bot = FakeBot()
         database = FakeDatabase()
@@ -156,13 +180,7 @@ class NotificationTests(unittest.TestCase):
             image_link=None,
         )
         event = SimpleNamespace(type=enums.EventTypes.NEW_MESSAGE, message=message)
-        row = {
-            "telegram_id": 99,
-            "message_notifications_enabled": True,
-            "order_notifications_enabled": True,
-            "greeting_enabled": False,
-            "greeting_text": "Hello",
-        }
+        row = self.row()
 
         asyncio.run(manager._deliver_events(row, SimpleNamespace(id=42), [event]))
 
@@ -192,19 +210,69 @@ class NotificationTests(unittest.TestCase):
         event = SimpleNamespace(
             type=enums.EventTypes.LAST_CHAT_MESSAGE_CHANGED, chat=chat
         )
-        row = {
-            "telegram_id": 99,
-            "message_notifications_enabled": True,
-            "order_notifications_enabled": True,
-            "greeting_enabled": False,
-            "greeting_text": "Hello",
-        }
+        row = self.row()
 
         asyncio.run(manager._deliver_events(row, SimpleNamespace(id=42), [event]))
         asyncio.run(manager._deliver_events(row, SimpleNamespace(id=42), [event]))
 
         self.assertEqual(len(bot.sent), 1)
         self.assertIn("Existing chat message", bot.sent[0][1])
+
+    def test_direct_history_poll_detects_existing_chat_and_equal_text(self):
+        bot = FakeBot()
+        database = FakeDatabase()
+        chat = SimpleNamespace(id=123, name="Buyer", unread=True)
+        first = SimpleNamespace(
+            id=501,
+            by_bot=False,
+            author_id=7,
+            author="Buyer",
+            chat_name="Buyer",
+            chat_id=123,
+            text="Same text",
+            image_link=None,
+        )
+        second = SimpleNamespace(
+            id=502,
+            by_bot=False,
+            author_id=7,
+            author="Buyer",
+            chat_name="Buyer",
+            chat_id=123,
+            text="Same text",
+            image_link=None,
+        )
+        funpay = FakeFunPay(chats=[chat], histories={123: [first]})
+        manager = NotificationManager(bot, database, None, funpay)
+
+        asyncio.run(manager._poll_chat_histories(self.row(), SimpleNamespace(id=42)))
+        funpay.histories = {123: [first, second]}
+        asyncio.run(manager._poll_chat_histories(self.row(), SimpleNamespace(id=42)))
+
+        self.assertEqual(len(bot.sent), 2)
+        self.assertEqual(database.cursors, {"123": 502})
+
+    def test_direct_history_poll_baselines_read_chats_without_replay(self):
+        bot = FakeBot()
+        database = FakeDatabase()
+        chat = SimpleNamespace(id=123, name="Buyer", unread=False)
+        old = SimpleNamespace(
+            id=500,
+            by_bot=False,
+            author_id=7,
+            author="Buyer",
+            chat_name="Buyer",
+            chat_id=123,
+            text="Old message",
+            image_link=None,
+        )
+        funpay = FakeFunPay(chats=[chat], histories={123: [old]})
+        manager = NotificationManager(bot, database, None, funpay)
+
+        asyncio.run(manager._poll_chat_histories(self.row(), SimpleNamespace(id=42)))
+
+        self.assertEqual(bot.sent, [])
+        self.assertEqual(database.cursors, {"123": 500})
 
     def test_greeting_is_sent_once_for_first_client_message(self):
         bot = FakeBot()
