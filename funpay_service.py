@@ -11,7 +11,11 @@ import requests
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from FunPayAPI.common.exceptions import RaiseError, UnauthorizedError
+from FunPayAPI.common.exceptions import (
+    RaiseError,
+    RequestFailedError,
+    UnauthorizedError,
+)
 
 from FunPayAPI import Account, Runner, enums
 from proxy_utils import proxy_mapping
@@ -19,6 +23,7 @@ from storage import Database, SecretCipher, StoredSecretError
 
 logger = logging.getLogger(__name__)
 DEFAULT_RAISE_INTERVAL = 4 * 60 * 60
+TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 
 class BalanceUnavailableError(RuntimeError):
@@ -49,6 +54,14 @@ def next_raise_delay(outcomes: list[RaiseOutcome]) -> int:
     if waits:
         return max(60, min(waits) + 10)
     return 15 * 60
+
+
+def monitor_error_label(stage: str, error: Exception) -> str:
+    if isinstance(error, RequestFailedError):
+        return f"{stage}: HTTP {error.status_code}"
+    if isinstance(error, (requests.RequestException, TimeoutError)):
+        return f"{stage}: прокси или тайм-аут"
+    return f"{stage}: {type(error).__name__}"
 
 
 class FunPayService:
@@ -199,7 +212,16 @@ class FunPayService:
 
     async def poll_events(self, runner: Runner) -> list[Any]:
         def request() -> list[Any]:
-            return runner.parse_updates(runner.get_updates())
+            for attempt in range(2):
+                try:
+                    return runner.parse_updates(runner.get_updates())
+                except UnauthorizedError:
+                    raise
+                except RequestFailedError as error:
+                    if error.status_code not in TRANSIENT_HTTP_STATUSES or attempt:
+                        raise
+                    time.sleep(2)
+            return []
 
         return await self._thread(request)
 
@@ -209,7 +231,22 @@ class FunPayService:
         """Fetch current chats and their message IDs without relying on Runner events."""
 
         def request() -> tuple[list[Any], dict[int | str, list[Any]]]:
-            chats = account.request_chats()
+            chats = []
+            for attempt in range(2):
+                try:
+                    chats = account.request_chats()
+                    break
+                except UnauthorizedError:
+                    raise
+                except RequestFailedError as error:
+                    if error.status_code not in TRANSIENT_HTTP_STATUSES or attempt:
+                        raise
+                    time.sleep(2)
+
+            # New and recently active conversations are always at the top.
+            # Ten histories fit into one runner request and avoid requesting
+            # all 50 conversations every few seconds through the proxy.
+            chats = chats[:10]
             histories: dict[int | str, list[Any]] = {}
             failed_batches = 0
 
@@ -220,10 +257,26 @@ class FunPayService:
                 batch = chats[offset : offset + 10]
                 chat_names = {chat.id: chat.name for chat in batch}
                 try:
-                    histories.update(account.get_chats_histories(chat_names))
+                    for attempt in range(2):
+                        try:
+                            histories.update(account.get_chats_histories(chat_names))
+                            break
+                        except UnauthorizedError:
+                            raise
+                        except RequestFailedError as error:
+                            if (
+                                error.status_code not in TRANSIENT_HTTP_STATUSES
+                                or attempt
+                            ):
+                                raise
+                            time.sleep(2)
                     continue
                 except UnauthorizedError:
                     raise
+                except RequestFailedError as error:
+                    if error.status_code in TRANSIENT_HTTP_STATUSES:
+                        raise
+                    failed_batches += 1
                 except Exception:  # noqa: BLE001 - retry each chat independently
                     failed_batches += 1
 
@@ -292,7 +345,7 @@ class NotificationManager:
         database: Database,
         cipher: SecretCipher,
         funpay: FunPayService,
-        poll_interval: float = 6.0,
+        poll_interval: float = 12.0,
     ):
         self.bot = bot
         self.database = database
@@ -366,23 +419,49 @@ class NotificationManager:
         telegram_id = row["telegram_id"]
         try:
             session = await self._session(row)
+            monitor_errors: list[str] = []
+            monitor_succeeded = False
             # Runner determines changes by the visible text/time in a chat
             # bookmark. It can miss an already existing chat or two equal
             # consecutive messages. Persistent message-ID cursors are the
             # authoritative source and run independently from order parsing.
             if row["message_notifications_enabled"] or row["greeting_enabled"]:
-                await self._poll_chat_histories(row, session.account)
+                try:
+                    await self._poll_chat_histories(row, session.account)
+                    monitor_succeeded = True
+                except UnauthorizedError:
+                    raise
+                except Exception as error:
+                    monitor_errors.append(monitor_error_label("сообщения", error))
+                    logger.exception(
+                        "FunPay message polling failed for Telegram user %s",
+                        telegram_id,
+                    )
 
             if row["order_notifications_enabled"]:
-                events = await self.funpay.poll_events(session.runner)
-                await self._deliver_events(row, session.account, events)
+                try:
+                    events = await self.funpay.poll_events(session.runner)
+                    await self._deliver_events(row, session.account, events)
+                    monitor_succeeded = True
+                except UnauthorizedError:
+                    raise
+                except Exception as error:
+                    monitor_errors.append(monitor_error_label("заказы", error))
+                    logger.exception(
+                        "FunPay order polling failed for Telegram user %s",
+                        telegram_id,
+                    )
 
             if (
                 row["message_notifications_enabled"]
                 or row["order_notifications_enabled"]
                 or row["greeting_enabled"]
             ):
-                await self.database.mark_monitor_success(telegram_id)
+                await self.database.mark_monitor_result(
+                    telegram_id,
+                    monitor_succeeded,
+                    "; ".join(monitor_errors) if monitor_errors else None,
+                )
 
             now = datetime.now(timezone.utc)
             next_raise_at = row["next_raise_at"]
