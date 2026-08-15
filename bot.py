@@ -26,6 +26,7 @@ from funpay_service import (
     FunPayService,
     NotificationManager,
     RaiseOutcome,
+    monitor_error_label,
     next_raise_delay,
 )
 from proxy_utils import ProxyFormatError, normalize_proxy
@@ -170,13 +171,23 @@ def autoraise_keyboard(row) -> InlineKeyboardMarkup:
 
 def notifications_text(row) -> str:
     last_success = row["monitor_last_success_at"]
-    if last_success:
+    last_poll = row["monitor_last_poll_at"]
+    error_name = row["monitor_last_error"]
+    is_partial = bool(
+        error_name
+        and last_success
+        and last_poll
+        and abs((last_poll - last_success).total_seconds()) < 2
+    )
+    if is_partial:
+        monitor_status = "⚠️ частично работает: " + html.escape(error_name)
+    elif error_name:
+        monitor_status = "❌ ошибка: " + html.escape(error_name)
+    elif last_success:
         monitor_status = (
             "✅ работает, последняя проверка: "
             + last_success.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC")
         )
-    elif row["monitor_last_error"]:
-        monitor_status = "❌ ошибка: " + html.escape(row["monitor_last_error"])
     else:
         monitor_status = "⏳ ещё не запускался после обновления"
     return (
@@ -363,7 +374,23 @@ async def report_funpay_error(
             f"❌ {html.escape(str(error))} Используйте /reset для переподключения."
         )
         return
-    if isinstance(error, (requests.RequestException, RequestFailedError, TimeoutError)):
+    if isinstance(error, RequestFailedError):
+        if error.status_code == 429:
+            await target.answer(
+                "❌ FunPay временно ограничил частоту запросов. "
+                "Бот повторит проверку автоматически с уменьшенной частотой."
+            )
+        elif error.status_code >= 500:
+            await target.answer(
+                f"❌ FunPay временно недоступен (HTTP {error.status_code}). "
+                "Бот повторит проверку автоматически."
+            )
+        else:
+            await target.answer(
+                f"❌ FunPay отклонил запрос мониторинга (HTTP {error.status_code})."
+            )
+        return
+    if isinstance(error, (requests.RequestException, TimeoutError)):
         await target.answer(
             "❌ FunPay не ответил через сохранённый прокси. Проверьте прокси или используйте /reset."
         )
@@ -864,7 +891,7 @@ async def callback_check_notifications(
         )
     except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
         await database.mark_monitor_error(
-            callback.from_user.id, type(error).__name__
+            callback.from_user.id, monitor_error_label("сообщения", error)
         )
         await report_funpay_error(
             callback.message, callback.from_user.id, error, database, state
