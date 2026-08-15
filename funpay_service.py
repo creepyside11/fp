@@ -354,7 +354,10 @@ class NotificationManager:
         golden_key = self.cipher.decrypt(encrypted_key)
         account = await self.funpay.account(golden_key, proxy_url)
         session = RuntimeSession(
-            fingerprint, account, Runner(account), time.monotonic()
+            fingerprint,
+            account,
+            Runner(account, disable_message_requests=True),
+            time.monotonic(),
         )
         self.sessions[telegram_id] = session
         return session
@@ -363,21 +366,16 @@ class NotificationManager:
         telegram_id = row["telegram_id"]
         try:
             session = await self._session(row)
-            if (
-                row["message_notifications_enabled"]
-                or row["order_notifications_enabled"]
-                or row["greeting_enabled"]
-            ):
-                events = await self.funpay.poll_events(session.runner)
-                await self._deliver_events(row, session.account, events)
-
             # Runner determines changes by the visible text/time in a chat
             # bookmark. It can miss an already existing chat or two equal
-            # consecutive messages. Persistent message-ID cursors make the
-            # direct scan authoritative; claim_message keeps Runner events
-            # and this fallback safely deduplicated.
+            # consecutive messages. Persistent message-ID cursors are the
+            # authoritative source and run independently from order parsing.
             if row["message_notifications_enabled"] or row["greeting_enabled"]:
                 await self._poll_chat_histories(row, session.account)
+
+            if row["order_notifications_enabled"]:
+                events = await self.funpay.poll_events(session.runner)
+                await self._deliver_events(row, session.account, events)
 
             if (
                 row["message_notifications_enabled"]
