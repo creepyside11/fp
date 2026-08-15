@@ -44,6 +44,7 @@ class Database:
             "order_notifications_enabled",
             "auto_raise_enabled",
             "raise_notifications_enabled",
+            "greeting_enabled",
         }
     )
 
@@ -101,6 +102,15 @@ class Database:
                 "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS "
                 "raise_notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE"
             ),
+            (
+                "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS "
+                "greeting_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+            ),
+            (
+                "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS "
+                "greeting_text TEXT NOT NULL DEFAULT "
+                "'Здравствуйте! Спасибо за обращение. Скоро отвечу вам.'"
+            ),
             "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS next_raise_at TIMESTAMPTZ",
         )
         for statement in migrations:
@@ -115,6 +125,30 @@ class Database:
                 PRIMARY KEY (telegram_id, chat_id)
             )
             """
+        )
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS funpay_seen_messages (
+                telegram_id BIGINT NOT NULL REFERENCES funpay_bot_users(telegram_id) ON DELETE CASCADE,
+                message_id BIGINT NOT NULL,
+                chat_id TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, message_id)
+            )
+            """
+        )
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS funpay_greeted_clients (
+                telegram_id BIGINT NOT NULL REFERENCES funpay_bot_users(telegram_id) ON DELETE CASCADE,
+                chat_id TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, chat_id)
+            )
+            """
+        )
+        await pool.execute(
+            "DELETE FROM funpay_seen_messages WHERE created_at < NOW() - INTERVAL '90 days'"
         )
 
     async def get_user(self, telegram_id: int) -> asyncpg.Record | None:
@@ -212,6 +246,17 @@ class Database:
             next_raise_at,
         )
 
+    async def set_greeting_text(self, telegram_id: int, greeting_text: str) -> None:
+        await self._pool().execute(
+            """
+            UPDATE funpay_bot_users
+            SET greeting_text = $2, updated_at = NOW()
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+            greeting_text,
+        )
+
     async def list_background_users(self) -> list[asyncpg.Record]:
         return await self._pool().fetch(
             """
@@ -222,8 +267,45 @@ class Database:
                   message_notifications_enabled
                   OR order_notifications_enabled
                   OR auto_raise_enabled
+                  OR greeting_enabled
               )
             """
+        )
+
+    async def claim_message(
+        self, telegram_id: int, message_id: int, chat_id: int | str
+    ) -> bool:
+        inserted = await self._pool().fetchval(
+            """
+            INSERT INTO funpay_seen_messages (telegram_id, message_id, chat_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (telegram_id, message_id) DO NOTHING
+            RETURNING message_id
+            """,
+            telegram_id,
+            message_id,
+            str(chat_id),
+        )
+        return inserted is not None
+
+    async def claim_greeting(self, telegram_id: int, chat_id: int | str) -> bool:
+        inserted = await self._pool().fetchval(
+            """
+            INSERT INTO funpay_greeted_clients (telegram_id, chat_id)
+            VALUES ($1, $2)
+            ON CONFLICT (telegram_id, chat_id) DO NOTHING
+            RETURNING chat_id
+            """,
+            telegram_id,
+            str(chat_id),
+        )
+        return inserted is not None
+
+    async def release_greeting(self, telegram_id: int, chat_id: int | str) -> None:
+        await self._pool().execute(
+            "DELETE FROM funpay_greeted_clients WHERE telegram_id = $1 AND chat_id = $2",
+            telegram_id,
+            str(chat_id),
         )
 
     async def save_chat_target(

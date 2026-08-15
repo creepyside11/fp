@@ -159,6 +159,44 @@ class FunPayService:
             chat_id = int(chat_id)
         return await self._thread(account.send_message, chat_id, text, chat_name)
 
+    async def latest_message(
+        self, account: Account, chat_id: int | str, chat_name: str | None
+    ) -> Any | None:
+        def request() -> Any | None:
+            normalized_chat_id: int | str = chat_id
+            if isinstance(normalized_chat_id, str) and normalized_chat_id.isdigit():
+                normalized_chat_id = int(normalized_chat_id)
+            messages = account.get_chat_history(
+                normalized_chat_id, interlocutor_username=chat_name
+            )
+            return messages[-1] if messages else None
+
+        return await self._thread(request)
+
+    async def is_first_client_message(self, account: Account, message: Any) -> bool:
+        def request() -> bool:
+            chat_id: int | str = message.chat_id
+            if isinstance(chat_id, str) and chat_id.isdigit():
+                chat_id = int(chat_id)
+            history = account.get_chat_history(
+                chat_id, interlocutor_username=message.chat_name
+            )
+            client_messages = [
+                item
+                for item in history
+                if item.author_id == message.author_id
+                and item.author_id not in (0, account.id)
+            ]
+            return bool(client_messages) and client_messages[0].id == message.id
+
+        return await self._thread(request)
+
+    async def lot_fields(self, account: Account, lot_id: int) -> Any:
+        return await self._thread(account.get_lot_fields, lot_id)
+
+    async def save_lot(self, account: Account, lot_fields: Any) -> None:
+        await self._thread(account.save_lot, lot_fields)
+
     async def poll_events(self, runner: Runner) -> list[Any]:
         def request() -> list[Any]:
             return runner.parse_updates(runner.get_updates())
@@ -258,6 +296,7 @@ class NotificationManager:
                 "order_notifications_enabled",
                 "auto_raise_enabled",
                 "raise_notifications_enabled",
+                "greeting_enabled",
             )
         )
         fingerprint = hashlib.sha256(
@@ -287,6 +326,7 @@ class NotificationManager:
             if (
                 row["message_notifications_enabled"]
                 or row["order_notifications_enabled"]
+                or row["greeting_enabled"]
             ):
                 events = await self.funpay.poll_events(session.runner)
                 await self._deliver_events(row, session.account, events)
@@ -326,46 +366,14 @@ class NotificationManager:
     async def _deliver_events(
         self, row: Any, account: Account, events: list[Any]
     ) -> None:
+        new_message_chat_ids: set[str] = set()
+
+        # Process concrete messages first. Runner also emits a generic
+        # LAST_CHAT_MESSAGE_CHANGED event for the same chat.
         for event in events:
-            if (
-                event.type is enums.EventTypes.NEW_MESSAGE
-                and row["message_notifications_enabled"]
-            ):
-                message = event.message
-                if message.by_bot or message.author_id in (0, account.id):
-                    continue
-                username = (
-                    message.author or message.chat_name or "Неизвестный пользователь"
-                )
-                await self.database.save_chat_target(
-                    row["telegram_id"], message.chat_id, username
-                )
-                if message.text:
-                    message_text = message.text.strip()
-                    if len(message_text) > 3000:
-                        message_text = message_text[:2997] + "…"
-                    body = html.escape(message_text)
-                elif message.image_link:
-                    body = f'<a href="{html.escape(message.image_link, quote=True)}">Изображение</a>'
-                else:
-                    body = "Сообщение без текста"
-                keyboard = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text=f"↩️ Ответить {username}"[:60],
-                                callback_data=f"reply:{message.chat_id}",
-                            )
-                        ]
-                    ]
-                )
-                await self._safe_send(
-                    row["telegram_id"],
-                    "💬 <b>Новое сообщение FunPay</b>\n\n"
-                    f"От: <b>{html.escape(username)}</b>\n"
-                    f"Сообщение: {body}",
-                    reply_markup=keyboard,
-                )
+            if event.type is enums.EventTypes.NEW_MESSAGE:
+                new_message_chat_ids.add(str(event.message.chat_id))
+                await self._handle_message(row, account, event.message)
             elif (
                 event.type is enums.EventTypes.NEW_ORDER
                 and row["order_notifications_enabled"]
@@ -383,6 +391,89 @@ class NotificationManager:
                     f"Сумма: <b>{order.price:,.2f} ₽</b>\n"
                     f'<a href="https://funpay.com/orders/{html.escape(order.id, quote=True)}/">Открыть заказ</a>',
                 )
+
+        # FunPayAPI can emit only a chat-change event when history parsing
+        # fails. Fetching the last message explicitly fixes notifications for
+        # already existing chats. INITIAL_CHAT covers messages received during
+        # worker startup; the database deduplicates them across restarts.
+        for event in events:
+            is_initial_unread = (
+                event.type is enums.EventTypes.INITIAL_CHAT and event.chat.unread
+            )
+            is_changed = event.type is enums.EventTypes.LAST_CHAT_MESSAGE_CHANGED
+            if not (is_initial_unread or is_changed):
+                continue
+            if str(event.chat.id) in new_message_chat_ids:
+                continue
+            message = await self.funpay.latest_message(
+                account, event.chat.id, event.chat.name
+            )
+            if message is not None:
+                await self._handle_message(row, account, message)
+
+    async def _handle_message(self, row: Any, account: Account, message: Any) -> None:
+        if message.by_bot or message.author_id in (0, account.id):
+            return
+        if not await self.database.claim_message(
+            row["telegram_id"], message.id, message.chat_id
+        ):
+            return
+
+        username = message.author or message.chat_name or "Неизвестный пользователь"
+        if row["message_notifications_enabled"]:
+            await self.database.save_chat_target(
+                row["telegram_id"], message.chat_id, username
+            )
+            if message.text:
+                message_text = message.text.strip()
+                if len(message_text) > 3000:
+                    message_text = message_text[:2997] + "…"
+                body = html.escape(message_text)
+            elif message.image_link:
+                body = f'<a href="{html.escape(message.image_link, quote=True)}">Изображение</a>'
+            else:
+                body = "Сообщение без текста"
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=f"↩️ Ответить {username}"[:60],
+                            callback_data=f"reply:{message.chat_id}",
+                        )
+                    ]
+                ]
+            )
+            await self._safe_send(
+                row["telegram_id"],
+                "💬 <b>Новое сообщение FunPay</b>\n\n"
+                f"От: <b>{html.escape(username)}</b>\n"
+                f"Сообщение: {body}",
+                reply_markup=keyboard,
+            )
+
+        if row["greeting_enabled"] and await self.funpay.is_first_client_message(
+            account, message
+        ):
+            claimed = await self.database.claim_greeting(
+                row["telegram_id"], message.chat_id
+            )
+            if claimed:
+                try:
+                    await self.funpay.send_message(
+                        account,
+                        message.chat_id,
+                        row["greeting_text"],
+                        username,
+                    )
+                except Exception:
+                    await self.database.release_greeting(
+                        row["telegram_id"], message.chat_id
+                    )
+                    logger.exception(
+                        "Failed to greet FunPay chat %s for Telegram user %s",
+                        message.chat_id,
+                        row["telegram_id"],
+                    )
 
     async def _send_raise_notification(
         self, telegram_id: int, outcomes: list[RaiseOutcome]

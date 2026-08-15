@@ -100,9 +100,44 @@ class FakeBot:
 class FakeDatabase:
     def __init__(self):
         self.targets = []
+        self.seen = set()
+        self.greeted = set()
 
     async def save_chat_target(self, telegram_id, chat_id, username):
         self.targets.append((telegram_id, chat_id, username))
+
+    async def claim_message(self, telegram_id, message_id, chat_id):
+        key = (telegram_id, message_id)
+        if key in self.seen:
+            return False
+        self.seen.add(key)
+        return True
+
+    async def claim_greeting(self, telegram_id, chat_id):
+        key = (telegram_id, str(chat_id))
+        if key in self.greeted:
+            return False
+        self.greeted.add(key)
+        return True
+
+    async def release_greeting(self, telegram_id, chat_id):
+        self.greeted.discard((telegram_id, str(chat_id)))
+
+
+class FakeFunPay:
+    def __init__(self, latest=None, first_client_message=False):
+        self.latest = latest
+        self.first_client_message = first_client_message
+        self.replies = []
+
+    async def latest_message(self, account, chat_id, chat_name):
+        return self.latest
+
+    async def is_first_client_message(self, account, message):
+        return self.first_client_message
+
+    async def send_message(self, account, chat_id, text, chat_name):
+        self.replies.append((chat_id, text, chat_name))
 
 
 class NotificationTests(unittest.TestCase):
@@ -111,6 +146,7 @@ class NotificationTests(unittest.TestCase):
         database = FakeDatabase()
         manager = NotificationManager(bot, database, None, None)
         message = SimpleNamespace(
+            id=500,
             by_bot=False,
             author_id=7,
             author="<Buyer>",
@@ -124,6 +160,8 @@ class NotificationTests(unittest.TestCase):
             "telegram_id": 99,
             "message_notifications_enabled": True,
             "order_notifications_enabled": True,
+            "greeting_enabled": False,
+            "greeting_text": "Hello",
         }
 
         asyncio.run(manager._deliver_events(row, SimpleNamespace(id=42), [event]))
@@ -135,6 +173,67 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(
             kwargs["reply_markup"].inline_keyboard[0][0].callback_data, "reply:123"
         )
+
+    def test_existing_chat_change_fetches_latest_message_and_deduplicates(self):
+        bot = FakeBot()
+        database = FakeDatabase()
+        latest = SimpleNamespace(
+            id=501,
+            by_bot=False,
+            author_id=7,
+            author="Buyer",
+            chat_name="Buyer",
+            chat_id=123,
+            text="Existing chat message",
+            image_link=None,
+        )
+        manager = NotificationManager(bot, database, None, FakeFunPay(latest=latest))
+        chat = SimpleNamespace(id=123, name="Buyer", unread=True)
+        event = SimpleNamespace(
+            type=enums.EventTypes.LAST_CHAT_MESSAGE_CHANGED, chat=chat
+        )
+        row = {
+            "telegram_id": 99,
+            "message_notifications_enabled": True,
+            "order_notifications_enabled": True,
+            "greeting_enabled": False,
+            "greeting_text": "Hello",
+        }
+
+        asyncio.run(manager._deliver_events(row, SimpleNamespace(id=42), [event]))
+        asyncio.run(manager._deliver_events(row, SimpleNamespace(id=42), [event]))
+
+        self.assertEqual(len(bot.sent), 1)
+        self.assertIn("Existing chat message", bot.sent[0][1])
+
+    def test_greeting_is_sent_once_for_first_client_message(self):
+        bot = FakeBot()
+        database = FakeDatabase()
+        funpay = FakeFunPay(first_client_message=True)
+        manager = NotificationManager(bot, database, None, funpay)
+        message = SimpleNamespace(
+            id=777,
+            by_bot=False,
+            author_id=7,
+            author="Buyer",
+            chat_name="Buyer",
+            chat_id=321,
+            text="Hi",
+            image_link=None,
+        )
+        event = SimpleNamespace(type=enums.EventTypes.NEW_MESSAGE, message=message)
+        row = {
+            "telegram_id": 99,
+            "message_notifications_enabled": False,
+            "order_notifications_enabled": False,
+            "greeting_enabled": True,
+            "greeting_text": "Welcome!",
+        }
+
+        asyncio.run(manager._deliver_events(row, SimpleNamespace(id=42), [event]))
+        asyncio.run(manager._deliver_events(row, SimpleNamespace(id=42), [event]))
+
+        self.assertEqual(funpay.replies, [(321, "Welcome!", "Buyer")])
 
 
 if __name__ == "__main__":

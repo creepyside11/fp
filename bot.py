@@ -45,6 +45,14 @@ class Reply(StatesGroup):
     waiting_text = State()
 
 
+class Greeting(StatesGroup):
+    waiting_text = State()
+
+
+class LotEdit(StatesGroup):
+    waiting_value = State()
+
+
 class ConfigurationError(RuntimeError):
     pass
 
@@ -67,6 +75,7 @@ def menu_keyboard() -> InlineKeyboardMarkup:
                 ),
                 InlineKeyboardButton(text="⬆️ Автоподнятие", callback_data="autoraise"),
             ],
+            [InlineKeyboardButton(text="👋 Приветствие", callback_data="greeting")],
             [
                 InlineKeyboardButton(
                     text="🔄 Сменить аккаунт / прокси", callback_data="reconnect"
@@ -76,7 +85,7 @@ def menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def lots_keyboard(page: int, pages: int) -> InlineKeyboardMarkup:
+def lots_keyboard(page: int, pages: int, visible_lots: list) -> InlineKeyboardMarkup:
     navigation: list[InlineKeyboardButton] = []
     if page > 0:
         navigation.append(
@@ -89,12 +98,18 @@ def lots_keyboard(page: int, pages: int) -> InlineKeyboardMarkup:
         navigation.append(
             InlineKeyboardButton(text="➡️", callback_data=f"lots:{page + 1}")
         )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            navigation,
-            [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"✏️ Редактировать #{lot.id}", callback_data=f"lot_edit:{lot.id}"
+            )
         ]
+        for lot in visible_lots
+    ]
+    rows.extend(
+        [navigation, [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")]]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def notifications_keyboard(row) -> InlineKeyboardMarkup:
@@ -166,6 +181,100 @@ def autoraise_text(row) -> str:
         f"Следующая попытка: <b>{next_text}</b>\n\n"
         "Поднимаются стандартные лоты во всех найденных категориях. "
         "Если FunPay вернёт таймер ожидания, следующая попытка будет назначена по нему."
+    )
+
+
+def greeting_keyboard(row) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"{status_icon(row['greeting_enabled'])} Автоприветствие",
+                    callback_data="greeting:toggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Изменить текст", callback_data="greeting:edit"
+                )
+            ],
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
+        ]
+    )
+
+
+def greeting_text(row) -> str:
+    text = html.escape(row["greeting_text"])
+    return (
+        "👋 <b>Приветствие новых клиентов</b>\n\n"
+        f"Статус: <b>{'включено' if row['greeting_enabled'] else 'выключено'}</b>\n\n"
+        f"Текст:\n<blockquote>{text}</blockquote>\n\n"
+        "Приветствие отправляется один раз — после первого сообщения нового клиента."
+    )
+
+
+def lot_edit_keyboard(lot_id: int, fields) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Название RU", callback_data=f"lot_field:title_ru:{lot_id}"
+                ),
+                InlineKeyboardButton(
+                    text="Название EN", callback_data=f"lot_field:title_en:{lot_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Описание RU",
+                    callback_data=f"lot_field:description_ru:{lot_id}",
+                ),
+                InlineKeyboardButton(
+                    text="Описание EN",
+                    callback_data=f"lot_field:description_en:{lot_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💰 Цена", callback_data=f"lot_field:price:{lot_id}"
+                ),
+                InlineKeyboardButton(
+                    text="📦 Количество", callback_data=f"lot_field:amount:{lot_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"{'✅' if fields.active else '❌'} Активность",
+                    callback_data=f"lot_toggle:active:{lot_id}",
+                ),
+                InlineKeyboardButton(
+                    text=f"{'✅' if fields.deactivate_after_sale else '❌'} После продажи",
+                    callback_data=f"lot_toggle:deactivate:{lot_id}",
+                ),
+            ],
+            [InlineKeyboardButton(text="📋 К объявлениям", callback_data="lots:0")],
+        ]
+    )
+
+
+def lot_edit_text(fields) -> str:
+    def shortened(value: str | None, limit: int = 350) -> str:
+        value = (value or "—").strip()
+        return value if len(value) <= limit else value[: limit - 1] + "…"
+
+    amount = "не указано" if fields.amount is None else str(fields.amount)
+    price = "не указана" if fields.price is None else f"{fields.price:,.2f} ₽"
+    return (
+        f"✏️ <b>Редактирование объявления #{fields.lot_id}</b>\n\n"
+        f"Название RU: <b>{html.escape(shortened(fields.title_ru, 180))}</b>\n"
+        f"Название EN: <b>{html.escape(shortened(fields.title_en, 180))}</b>\n"
+        f"Описание RU: {html.escape(shortened(fields.description_ru))}\n"
+        f"Описание EN: {html.escape(shortened(fields.description_en))}\n"
+        f"Цена: <b>{price}</b>\n"
+        f"Количество: <b>{amount}</b>\n"
+        f"Активно: <b>{'да' if fields.active else 'нет'}</b>\n"
+        f"Отключать после продажи: <b>{'да' if fields.deactivate_after_sale else 'нет'}</b>\n\n"
+        "Каждое изменение сохраняется сразу в FunPay."
     )
 
 
@@ -507,9 +616,8 @@ async def callback_lots(
         chunks = [
             f"📋 <b>Объявления {html.escape(profile.username)}</b> — {len(lots)} шт.\n"
         ]
-        for index, lot in enumerate(
-            lots[page * PAGE_SIZE : (page + 1) * PAGE_SIZE], start=page * PAGE_SIZE + 1
-        ):
+        visible_lots = lots[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+        for index, lot in enumerate(visible_lots, start=page * PAGE_SIZE + 1):
             category = getattr(
                 getattr(lot, "subcategory", None), "fullname", "Без категории"
             )
@@ -524,7 +632,7 @@ async def callback_lots(
                 f'<a href="{html.escape(lot.public_link, quote=True)}">открыть</a>'
             )
         text = "\n".join(chunks)
-        keyboard = lots_keyboard(page, pages)
+        keyboard = lots_keyboard(page, pages, visible_lots)
         if callback.message.text and callback.message.text.startswith("📋"):
             await callback.message.edit_text(
                 text, reply_markup=keyboard, disable_web_page_preview=True
@@ -539,12 +647,235 @@ async def callback_lots(
         )
 
 
+@router.callback_query(F.data.startswith("lot_edit:"))
+async def callback_lot_edit(
+    callback: CallbackQuery,
+    state: FSMContext,
+    database: Database,
+    cipher: SecretCipher,
+    funpay: FunPayService,
+) -> None:
+    await callback.answer("Загружаю объявление…")
+    try:
+        lot_id = int(callback.data.rsplit(":", 1)[1])
+        account = await load_account(callback.from_user.id, database, cipher, funpay)
+        fields = await funpay.lot_fields(account, lot_id)
+        await state.clear()
+        await callback.message.answer(
+            lot_edit_text(fields), reply_markup=lot_edit_keyboard(lot_id, fields)
+        )
+    except (ValueError, IndexError):
+        await callback.message.answer("❌ Некорректный ID объявления.")
+    except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
+        await report_funpay_error(
+            callback.message, callback.from_user.id, error, database, state
+        )
+
+
+@router.callback_query(F.data.startswith("lot_field:"))
+async def callback_lot_field(callback: CallbackQuery, state: FSMContext) -> None:
+    prompts = {
+        "title_ru": "Введите новое название на русском.",
+        "title_en": "Введите новое название на английском.",
+        "description_ru": "Введите новое описание на русском.",
+        "description_en": "Введите новое описание на английском.",
+        "price": "Введите новую цену, например: 199.90",
+        "amount": "Введите количество целым числом или «-», чтобы очистить.",
+    }
+    try:
+        _, field, lot_id_text = callback.data.split(":", 2)
+        lot_id = int(lot_id_text)
+        prompt = prompts[field]
+    except (ValueError, KeyError):
+        await callback.answer("Некорректное поле", show_alert=True)
+        return
+    await state.set_state(LotEdit.waiting_value)
+    await state.update_data(lot_id=lot_id, lot_field=field)
+    await callback.answer()
+    await callback.message.answer(
+        f"✏️ {prompt}\n\nДля текстового поля отправьте <code>-</code>, чтобы очистить его.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Отмена", callback_data=f"lot_edit:{lot_id}"
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+@router.message(LotEdit.waiting_value, F.text)
+async def receive_lot_value(
+    message: Message,
+    state: FSMContext,
+    database: Database,
+    cipher: SecretCipher,
+    funpay: FunPayService,
+) -> None:
+    data = await state.get_data()
+    lot_id = data.get("lot_id")
+    field = data.get("lot_field")
+    value = message.text.strip()
+    if not lot_id or field not in {
+        "title_ru",
+        "title_en",
+        "description_ru",
+        "description_en",
+        "price",
+        "amount",
+    }:
+        await state.clear()
+        await message.answer(
+            "Контекст редактирования потерян. Откройте объявление заново."
+        )
+        return
+
+    try:
+        if field in {"title_ru", "title_en"} and len(value) > 200:
+            raise ValueError("Название не должно быть длиннее 200 символов.")
+        if field in {"description_ru", "description_en"} and len(value) > 10000:
+            raise ValueError("Описание не должно быть длиннее 10 000 символов.")
+
+        account = await load_account(message.from_user.id, database, cipher, funpay)
+        fields = await funpay.lot_fields(account, int(lot_id))
+        if field == "price":
+            try:
+                price = float(value.replace(",", "."))
+            except ValueError as error:
+                raise ValueError("Введите цену числом, например 199.90.") from error
+            if price <= 0:
+                raise ValueError("Цена должна быть больше нуля.")
+            fields.price = price
+        elif field == "amount":
+            if value == "-":
+                fields.amount = None
+            else:
+                try:
+                    amount = int(value)
+                except ValueError as error:
+                    raise ValueError("Введите количество целым числом.") from error
+                if amount < 0:
+                    raise ValueError("Количество не может быть отрицательным.")
+                fields.amount = amount
+        else:
+            setattr(fields, field, "" if value == "-" else value)
+
+        await funpay.save_lot(account, fields)
+        fields = await funpay.lot_fields(account, int(lot_id))
+        await state.clear()
+        await message.answer(
+            "✅ Изменение сохранено в FunPay.\n\n" + lot_edit_text(fields),
+            reply_markup=lot_edit_keyboard(int(lot_id), fields),
+        )
+    except ValueError as error:
+        await message.answer(f"❌ {html.escape(str(error))} Попробуйте ещё раз.")
+    except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
+        await report_funpay_error(message, message.from_user.id, error, database, state)
+
+
+@router.callback_query(F.data.startswith("lot_toggle:"))
+async def callback_lot_toggle(
+    callback: CallbackQuery,
+    state: FSMContext,
+    database: Database,
+    cipher: SecretCipher,
+    funpay: FunPayService,
+) -> None:
+    try:
+        _, toggle, lot_id_text = callback.data.split(":", 2)
+        lot_id = int(lot_id_text)
+        if toggle not in {"active", "deactivate"}:
+            raise ValueError
+    except ValueError:
+        await callback.answer("Некорректное действие", show_alert=True)
+        return
+    await callback.answer("Сохраняю…")
+    try:
+        account = await load_account(callback.from_user.id, database, cipher, funpay)
+        fields = await funpay.lot_fields(account, lot_id)
+        if toggle == "active":
+            fields.active = not fields.active
+        else:
+            fields.deactivate_after_sale = not fields.deactivate_after_sale
+        await funpay.save_lot(account, fields)
+        fields = await funpay.lot_fields(account, lot_id)
+        await callback.message.edit_text(
+            lot_edit_text(fields), reply_markup=lot_edit_keyboard(lot_id, fields)
+        )
+    except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
+        await report_funpay_error(
+            callback.message, callback.from_user.id, error, database, state
+        )
+
+
 @router.callback_query(F.data == "notifications")
 async def callback_notifications(callback: CallbackQuery, database: Database) -> None:
     await callback.answer()
     row = await database.get_user(callback.from_user.id)
     await callback.message.edit_text(
         notifications_text(row), reply_markup=notifications_keyboard(row)
+    )
+
+
+@router.callback_query(F.data == "greeting")
+async def callback_greeting(
+    callback: CallbackQuery, state: FSMContext, database: Database
+) -> None:
+    await callback.answer()
+    await state.clear()
+    row = await database.get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        greeting_text(row), reply_markup=greeting_keyboard(row)
+    )
+
+
+@router.callback_query(F.data == "greeting:toggle")
+async def callback_greeting_toggle(callback: CallbackQuery, database: Database) -> None:
+    row = await database.get_user(callback.from_user.id)
+    enabled = not row["greeting_enabled"]
+    await database.set_setting(callback.from_user.id, "greeting_enabled", enabled)
+    await callback.answer(
+        "Приветствие включено" if enabled else "Приветствие выключено"
+    )
+    row = await database.get_user(callback.from_user.id)
+    await callback.message.edit_text(
+        greeting_text(row), reply_markup=greeting_keyboard(row)
+    )
+
+
+@router.callback_query(F.data == "greeting:edit")
+async def callback_greeting_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(Greeting.waiting_text)
+    await callback.answer()
+    await callback.message.answer(
+        "✏️ Отправьте новый текст приветствия (до 1000 символов).",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Отмена", callback_data="greeting")]
+            ]
+        ),
+    )
+
+
+@router.message(Greeting.waiting_text, F.text)
+async def receive_greeting_text(
+    message: Message, state: FSMContext, database: Database
+) -> None:
+    value = message.text.strip()
+    if not value:
+        await message.answer("Приветствие не может быть пустым.")
+        return
+    if len(value) > 1000:
+        await message.answer("Приветствие слишком длинное. Максимум — 1000 символов.")
+        return
+    await database.set_greeting_text(message.from_user.id, value)
+    await state.clear()
+    row = await database.get_user(message.from_user.id)
+    await message.answer(
+        "✅ Приветствие сохранено.\n\n" + greeting_text(row),
+        reply_markup=greeting_keyboard(row),
     )
 
 
