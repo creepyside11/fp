@@ -203,6 +203,46 @@ class FunPayService:
 
         return await self._thread(request)
 
+    async def chat_histories(
+        self, account: Account
+    ) -> tuple[list[Any], dict[int | str, list[Any]]]:
+        """Fetch current chats and their message IDs without relying on Runner events."""
+
+        def request() -> tuple[list[Any], dict[int | str, list[Any]]]:
+            chats = account.request_chats()
+            histories: dict[int | str, list[Any]] = {}
+            failed_batches = 0
+
+            # FunPay's runner endpoint is designed for packs of up to ten chat
+            # objects. A failed pack is retried chat-by-chat so one malformed
+            # conversation cannot disable notifications for every other chat.
+            for offset in range(0, len(chats), 10):
+                batch = chats[offset : offset + 10]
+                chat_names = {chat.id: chat.name for chat in batch}
+                try:
+                    histories.update(account.get_chats_histories(chat_names))
+                    continue
+                except UnauthorizedError:
+                    raise
+                except Exception:  # noqa: BLE001 - retry each chat independently
+                    failed_batches += 1
+
+                for chat in batch:
+                    try:
+                        histories[chat.id] = account.get_chat_history(
+                            chat.id, interlocutor_username=chat.name
+                        )
+                    except UnauthorizedError:
+                        raise
+                    except Exception:
+                        logger.exception("Failed to fetch FunPay chat %s", chat.id)
+
+            if chats and not histories and failed_batches:
+                raise RuntimeError("FunPay chat histories are unavailable")
+            return chats, histories
+
+        return await self._thread(request)
+
     async def raise_all(self, account: Account) -> list[RaiseOutcome]:
         def request() -> list[RaiseOutcome]:
             profile = account.get_user(account.id)
@@ -331,6 +371,21 @@ class NotificationManager:
                 events = await self.funpay.poll_events(session.runner)
                 await self._deliver_events(row, session.account, events)
 
+            # Runner determines changes by the visible text/time in a chat
+            # bookmark. It can miss an already existing chat or two equal
+            # consecutive messages. Persistent message-ID cursors make the
+            # direct scan authoritative; claim_message keeps Runner events
+            # and this fallback safely deduplicated.
+            if row["message_notifications_enabled"] or row["greeting_enabled"]:
+                await self._poll_chat_histories(row, session.account)
+
+            if (
+                row["message_notifications_enabled"]
+                or row["order_notifications_enabled"]
+                or row["greeting_enabled"]
+            ):
+                await self.database.mark_monitor_success(telegram_id)
+
             now = datetime.now(timezone.utc)
             next_raise_at = row["next_raise_at"]
             if row["auto_raise_enabled"] and (
@@ -347,6 +402,7 @@ class NotificationManager:
                     await self._send_raise_notification(telegram_id, outcomes)
         except UnauthorizedError:
             self.sessions.pop(telegram_id, None)
+            await self.database.mark_monitor_error(telegram_id, "UnauthorizedError")
             await self.database.clear_key(telegram_id)
             await self._safe_send(
                 telegram_id,
@@ -354,14 +410,46 @@ class NotificationManager:
             )
         except StoredSecretError:
             self.sessions.pop(telegram_id, None)
+            await self.database.mark_monitor_error(telegram_id, "StoredSecretError")
             logger.warning(
                 "Stored credentials cannot be decrypted for Telegram user %s",
                 telegram_id,
             )
-        except Exception:
+        except Exception as error:
+            await self.database.mark_monitor_error(telegram_id, type(error).__name__)
             logger.exception(
                 "FunPay background processing failed for Telegram user %s", telegram_id
             )
+
+    async def _poll_chat_histories(self, row: Any, account: Account) -> None:
+        chats, histories = await self.funpay.chat_histories(account)
+        telegram_id = row["telegram_id"]
+        saved_cursors = await self.database.get_chat_cursors(telegram_id)
+        changed_cursors: dict[int | str, int] = {}
+
+        for chat in chats:
+            messages = sorted(histories.get(chat.id, []), key=lambda item: item.id)
+            if not messages:
+                continue
+
+            chat_key = str(chat.id)
+            previous_id = saved_cursors.get(chat_key)
+            latest_id = messages[-1].id
+            if previous_id is None:
+                # Do not replay up to fifty old conversations on the first
+                # deployment. An unread chat is the one important exception:
+                # deliver its latest incoming message immediately.
+                candidates = [messages[-1]] if chat.unread else []
+            else:
+                candidates = [message for message in messages if message.id > previous_id]
+
+            for message in candidates:
+                await self._handle_message(row, account, message)
+
+            if previous_id is None or latest_id > previous_id:
+                changed_cursors[chat.id] = latest_id
+
+        await self.database.save_chat_cursors(telegram_id, changed_cursors)
 
     async def _deliver_events(
         self, row: Any, account: Account, events: list[Any]
