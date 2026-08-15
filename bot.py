@@ -127,6 +127,17 @@ def notifications_keyboard(row) -> InlineKeyboardMarkup:
                     callback_data="notify:orders",
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text="🧪 Проверить мониторинг",
+                    callback_data="notifications:check",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить статус", callback_data="notifications"
+                )
+            ],
             [InlineKeyboardButton(text="🏠 Меню", callback_data="menu")],
         ]
     )
@@ -158,10 +169,21 @@ def autoraise_keyboard(row) -> InlineKeyboardMarkup:
 
 
 def notifications_text(row) -> str:
+    last_success = row["monitor_last_success_at"]
+    if last_success:
+        monitor_status = (
+            "✅ работает, последняя проверка: "
+            + last_success.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC")
+        )
+    elif row["monitor_last_error"]:
+        monitor_status = "❌ ошибка: " + html.escape(row["monitor_last_error"])
+    else:
+        monitor_status = "⏳ ещё не запускался после обновления"
     return (
         "🔔 <b>Уведомления FunPay</b>\n\n"
         f"Новые сообщения: <b>{'включены' if row['message_notifications_enabled'] else 'выключены'}</b>\n"
-        f"Новые заказы: <b>{'включены' if row['order_notifications_enabled'] else 'выключены'}</b>\n\n"
+        f"Новые заказы: <b>{'включены' if row['order_notifications_enabled'] else 'выключены'}</b>\n"
+        f"Мониторинг: <b>{monitor_status}</b>\n\n"
         "В уведомлении о сообщении показывается ник собеседника и кнопка быстрого ответа."
     )
 
@@ -817,6 +839,36 @@ async def callback_notifications(callback: CallbackQuery, database: Database) ->
     await callback.message.edit_text(
         notifications_text(row), reply_markup=notifications_keyboard(row)
     )
+
+
+@router.callback_query(F.data == "notifications:check")
+async def callback_check_notifications(
+    callback: CallbackQuery,
+    state: FSMContext,
+    database: Database,
+    cipher: SecretCipher,
+    funpay: FunPayService,
+) -> None:
+    await callback.answer("Проверяю FunPay…")
+    try:
+        account = await load_account(callback.from_user.id, database, cipher, funpay)
+        chats, histories = await funpay.chat_histories(account)
+        await database.mark_monitor_success(callback.from_user.id)
+        row = await database.get_user(callback.from_user.id)
+        message_count = sum(len(messages) for messages in histories.values())
+        await callback.message.edit_text(
+            notifications_text(row)
+            + "\n\n"
+            + f"🧪 Доступно чатов: <b>{len(chats)}</b>, получено сообщений для проверки: <b>{message_count}</b>.",
+            reply_markup=notifications_keyboard(row),
+        )
+    except Exception as error:  # noqa: BLE001 - centralized FunPay error reporting
+        await database.mark_monitor_error(
+            callback.from_user.id, type(error).__name__
+        )
+        await report_funpay_error(
+            callback.message, callback.from_user.id, error, database, state
+        )
 
 
 @router.callback_query(F.data == "greeting")
