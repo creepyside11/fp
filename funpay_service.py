@@ -1,8 +1,8 @@
 import asyncio
 import hashlib
 import html
-import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -12,16 +12,15 @@ import requests
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from bs4 import BeautifulSoup
 from FunPayAPI.common.exceptions import (
     RaiseError,
     RequestFailedError,
     UnauthorizedError,
 )
 
-from FunPayAPI import Account, Runner, enums, types
+from FunPayAPI import Account, Runner, enums
 from proxy_utils import proxy_mapping
-from storage import Database, SecretCipher, StoredSecretError
+from storage import DEFAULT_USER_AGENT, Database, SecretCipher, StoredSecretError
 
 logger = logging.getLogger(__name__)
 DEFAULT_RAISE_INTERVAL = 4 * 60 * 60
@@ -60,7 +59,10 @@ def next_raise_delay(outcomes: list[RaiseOutcome]) -> int:
 
 def monitor_error_label(stage: str, error: Exception) -> str:
     if isinstance(error, RequestFailedError):
-        return f"{stage}: HTTP {error.status_code}"
+        body = re.sub(r"<[^>]+>", " ", error.response.text or "")
+        body = " ".join(body.split())[:70]
+        suffix = f" — {body}" if body else ""
+        return f"{stage}: HTTP {error.status_code}{suffix}"
     if isinstance(error, (requests.RequestException, TimeoutError)):
         return f"{stage}: прокси или тайм-аут"
     return f"{stage}: {type(error).__name__}"
@@ -87,10 +89,13 @@ class FunPayService:
 
         await self._thread(request)
 
-    async def account(self, golden_key: str, proxy_url: str) -> Account:
+    async def account(
+        self, golden_key: str, proxy_url: str, user_agent: str | None = None
+    ) -> Account:
         def request() -> Account:
             return Account(
                 golden_key,
+                user_agent=user_agent or DEFAULT_USER_AGENT,
                 requests_timeout=15,
                 proxy=proxy_mapping(proxy_url),
             ).get()
@@ -212,57 +217,22 @@ class FunPayService:
     async def save_lot(self, account: Account, lot_fields: Any) -> None:
         await self._thread(account.save_lot, lot_fields)
 
-    @staticmethod
-    def _runner_post(account: Account, objects: list[dict[str, Any]]) -> dict[str, Any]:
-        """Call FunPay runner with a lowercase false form value.
-
-        requests encodes Python ``False`` as ``False``. FunPay currently
-        validates this field as the lowercase form value ``false`` and may
-        otherwise return HTTP 400. Object booleans are inside JSON and are
-        already serialized correctly by json.dumps().
-        """
-        response = account.method(
-            "post",
-            "runner/",
-            {
-                "accept": "*/*",
-                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "x-requested-with": "XMLHttpRequest",
-            },
-            {
-                "objects": json.dumps(objects),
-                "request": "false",
-                "csrf_token": account.csrf_token,
-            },
-            raise_not_200=True,
-        )
-        return response.json()
-
     async def poll_events(self, runner: Runner) -> list[Any]:
         def request() -> list[Any]:
             for attempt in range(2):
                 try:
-                    order_tag = getattr(
-                        runner, "_Runner__last_order_event_tag", "00000000"
-                    )
-                    updates = self._runner_post(
-                        runner.account,
-                        [
-                            {
-                                "type": "orders_counters",
-                                "id": runner.account.id,
-                                "tag": order_tag,
-                                "data": False,
-                            }
-                        ],
-                    )
-                    return runner.parse_updates(updates)
+                    return runner.parse_updates(runner.get_updates())
                 except UnauthorizedError:
                     raise
                 except RequestFailedError as error:
-                    if error.status_code not in TRANSIENT_HTTP_STATUSES or attempt:
+                    if attempt:
                         raise
-                    time.sleep(2)
+                    if error.status_code == 400:
+                        runner.account.get(update_phpsessid=True)
+                    elif error.status_code in TRANSIENT_HTTP_STATUSES:
+                        time.sleep(2)
+                    else:
+                        raise
             return []
 
         return await self._thread(request)
@@ -273,53 +243,22 @@ class FunPayService:
         """Fetch current chats and their message IDs without relying on Runner events."""
 
         def request() -> tuple[list[Any], dict[int | str, list[Any]]]:
-            chats_response: dict[str, Any] = {}
+            chats: list[Any] = []
             for attempt in range(2):
                 try:
-                    chats_response = self._runner_post(
-                        account,
-                        [
-                            {
-                                "type": "chat_bookmarks",
-                                "id": account.id,
-                                "tag": "00000000",
-                                "data": False,
-                            }
-                        ],
-                    )
+                    chats = account.request_chats()
                     break
                 except UnauthorizedError:
                     raise
                 except RequestFailedError as error:
-                    if error.status_code not in TRANSIENT_HTTP_STATUSES or attempt:
+                    if attempt:
                         raise
-                    time.sleep(2)
-
-            chats_html = ""
-            for item in chats_response.get("objects", []):
-                if item.get("type") != "chat_bookmarks" or not item.get("data"):
-                    continue
-                chats_html = item["data"].get("html", "")
-                break
-
-            chats: list[Any] = []
-            parser = BeautifulSoup(chats_html, "html.parser")
-            for element in parser.find_all("a", {"class": "contact-item"}):
-                message_element = element.find(
-                    "div", {"class": "contact-item-message"}
-                )
-                name_element = element.find("div", {"class": "media-user-name"})
-                if not message_element or not name_element:
-                    continue
-                chats.append(
-                    types.ChatShortcut(
-                        int(element["data-id"]),
-                        name_element.text.strip(),
-                        message_element.text,
-                        "unread" in element.get("class", []),
-                        str(element),
-                    )
-                )
+                    if error.status_code == 400:
+                        account.get(update_phpsessid=True)
+                    elif error.status_code in TRANSIENT_HTTP_STATUSES:
+                        time.sleep(2)
+                    else:
+                        raise
 
             # New and recently active conversations are always at the top.
             # Ten histories fit into one runner request and avoid requesting
@@ -337,49 +276,19 @@ class FunPayService:
                 try:
                     for attempt in range(2):
                         try:
-                            objects = [
-                                {
-                                    "type": "chat_node",
-                                    "id": chat.id,
-                                    "tag": "00000000",
-                                    "data": {
-                                        "node": chat.id,
-                                        "last_message": -1,
-                                        "content": "",
-                                    },
-                                }
-                                for chat in batch
-                            ]
-                            history_response = self._runner_post(account, objects)
-                            for item in history_response.get("objects", []):
-                                chat_id = item.get("id")
-                                if not item.get("data"):
-                                    histories[chat_id] = []
-                                    continue
-                                parse_messages = account._Account__parse_messages
-                                if isinstance(chat_id, int):
-                                    node_name = item["data"]["node"]["name"]
-                                    interlocutor_id = int(node_name.split("-")[2])
-                                    interlocutor_name = chat_names.get(chat_id)
-                                else:
-                                    interlocutor_id = None
-                                    interlocutor_name = None
-                                histories[chat_id] = parse_messages(
-                                    item["data"]["messages"],
-                                    chat_id,
-                                    interlocutor_id,
-                                    interlocutor_name,
-                                )
+                            histories.update(account.get_chats_histories(chat_names))
                             break
                         except UnauthorizedError:
                             raise
                         except RequestFailedError as error:
-                            if (
-                                error.status_code not in TRANSIENT_HTTP_STATUSES
-                                or attempt
-                            ):
+                            if attempt:
                                 raise
-                            time.sleep(2)
+                            if error.status_code == 400:
+                                account.get(update_phpsessid=True)
+                            elif error.status_code in TRANSIENT_HTTP_STATUSES:
+                                time.sleep(2)
+                            else:
+                                raise
                     continue
                 except UnauthorizedError:
                     raise
@@ -492,6 +401,7 @@ class NotificationManager:
         telegram_id = row["telegram_id"]
         encrypted_proxy = row["encrypted_proxy"]
         encrypted_key = row["encrypted_golden_key"]
+        user_agent = row["funpay_user_agent"] or DEFAULT_USER_AGENT
         settings_fingerprint = ":".join(
             str(bool(row[name]))
             for name in (
@@ -503,7 +413,7 @@ class NotificationManager:
             )
         )
         fingerprint = hashlib.sha256(
-            f"{encrypted_proxy}:{encrypted_key}:{settings_fingerprint}".encode()
+            f"{encrypted_proxy}:{encrypted_key}:{user_agent}:{settings_fingerprint}".encode()
         ).hexdigest()
         cached = self.sessions.get(telegram_id)
         if (
@@ -515,7 +425,11 @@ class NotificationManager:
 
         proxy_url = self.cipher.decrypt(encrypted_proxy)
         golden_key = self.cipher.decrypt(encrypted_key)
-        account = await self.funpay.account(golden_key, proxy_url)
+        account = await self.funpay.account(
+            golden_key,
+            proxy_url,
+            user_agent,
+        )
         session = RuntimeSession(
             fingerprint,
             account,
