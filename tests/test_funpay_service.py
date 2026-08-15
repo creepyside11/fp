@@ -1,6 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from funpay_service import (
     BalanceUnavailableError,
@@ -10,6 +11,7 @@ from funpay_service import (
     next_raise_delay,
 )
 from FunPayAPI import enums
+from storage import DEFAULT_USER_AGENT
 
 
 class FakeLot:
@@ -79,6 +81,27 @@ class BalanceTests(unittest.TestCase):
             asyncio.run(FunPayService().balance(account))
 
 
+class AccountTests(unittest.TestCase):
+    def test_account_uses_browser_user_agent_by_default(self):
+        initiated = SimpleNamespace(id=42)
+        with patch("funpay_service.Account") as account_class:
+            account_class.return_value.get.return_value = initiated
+            result = asyncio.run(
+                FunPayService().account("golden-key", "http://127.0.0.1:8080")
+            )
+
+        self.assertIs(result, initiated)
+        account_class.assert_called_once_with(
+            "golden-key",
+            user_agent=DEFAULT_USER_AGENT,
+            requests_timeout=15,
+            proxy={
+                "http": "http://127.0.0.1:8080",
+                "https": "http://127.0.0.1:8080",
+            },
+        )
+
+
 class RaiseScheduleTests(unittest.TestCase):
     def test_success_uses_default_interval(self):
         outcomes = [RaiseOutcome(1, "Game", True)]
@@ -92,43 +115,18 @@ class RaiseScheduleTests(unittest.TestCase):
 class ChatHistoryServiceTests(unittest.TestCase):
     def test_only_requests_ten_most_recent_chat_histories(self):
         class Account:
-            id = 42
-            csrf_token = "csrf"
-
             def __init__(self):
                 self.requested_chat_ids = []
-                self.request_values = []
 
-            def method(
-                self, request_method, api_method, headers, payload, raise_not_200=False
-            ):
-                self.request_values.append(payload["request"])
-                objects = __import__("json").loads(payload["objects"])
-                if objects[0]["type"] == "chat_bookmarks":
-                    html = "".join(
-                        f'<a class="contact-item" data-id="{index}">'
-                        f'<div class="media-user-name">Buyer {index}</div>'
-                        f'<div class="contact-item-message">Message {index}</div>'
-                        "</a>"
-                        for index in range(15)
-                    )
-                    result = {
-                        "objects": [
-                            {
-                                "type": "chat_bookmarks",
-                                "data": {"html": html},
-                            }
-                        ]
-                    }
-                else:
-                    self.requested_chat_ids = [item["id"] for item in objects]
-                    result = {
-                        "objects": [
-                            {"type": "chat_node", "id": item["id"], "data": False}
-                            for item in objects
-                        ]
-                    }
-                return SimpleNamespace(json=lambda: result)
+            def request_chats(self):
+                return [
+                    SimpleNamespace(id=index, name=f"Buyer {index}")
+                    for index in range(15)
+                ]
+
+            def get_chats_histories(self, chat_names):
+                self.requested_chat_ids = list(chat_names)
+                return {chat_id: [] for chat_id in chat_names}
 
         account = Account()
         chats, histories = asyncio.run(FunPayService().chat_histories(account))
@@ -136,7 +134,6 @@ class ChatHistoryServiceTests(unittest.TestCase):
         self.assertEqual(len(chats), 10)
         self.assertEqual(account.requested_chat_ids, list(range(10)))
         self.assertEqual(set(histories), set(range(10)))
-        self.assertEqual(account.request_values, ["false", "false"])
 
 
 class FakeBot:
