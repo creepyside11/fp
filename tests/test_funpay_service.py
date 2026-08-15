@@ -89,6 +89,30 @@ class RaiseScheduleTests(unittest.TestCase):
         self.assertEqual(next_raise_delay(outcomes), 135)
 
 
+class ChatHistoryServiceTests(unittest.TestCase):
+    def test_only_requests_ten_most_recent_chat_histories(self):
+        class Account:
+            def __init__(self):
+                self.requested_chat_ids = []
+
+            def request_chats(self):
+                return [
+                    SimpleNamespace(id=index, name=f"Buyer {index}")
+                    for index in range(15)
+                ]
+
+            def get_chats_histories(self, chat_names):
+                self.requested_chat_ids = list(chat_names)
+                return {chat_id: [] for chat_id in chat_names}
+
+        account = Account()
+        chats, histories = asyncio.run(FunPayService().chat_histories(account))
+
+        self.assertEqual(len(chats), 10)
+        self.assertEqual(account.requested_chat_ids, list(range(10)))
+        self.assertEqual(set(histories), set(range(10)))
+
+
 class FakeBot:
     def __init__(self):
         self.sent = []
