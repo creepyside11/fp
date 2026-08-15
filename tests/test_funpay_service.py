@@ -92,18 +92,43 @@ class RaiseScheduleTests(unittest.TestCase):
 class ChatHistoryServiceTests(unittest.TestCase):
     def test_only_requests_ten_most_recent_chat_histories(self):
         class Account:
+            id = 42
+            csrf_token = "csrf"
+
             def __init__(self):
                 self.requested_chat_ids = []
+                self.request_values = []
 
-            def request_chats(self):
-                return [
-                    SimpleNamespace(id=index, name=f"Buyer {index}")
-                    for index in range(15)
-                ]
-
-            def get_chats_histories(self, chat_names):
-                self.requested_chat_ids = list(chat_names)
-                return {chat_id: [] for chat_id in chat_names}
+            def method(
+                self, request_method, api_method, headers, payload, raise_not_200=False
+            ):
+                self.request_values.append(payload["request"])
+                objects = __import__("json").loads(payload["objects"])
+                if objects[0]["type"] == "chat_bookmarks":
+                    html = "".join(
+                        f'<a class="contact-item" data-id="{index}">'
+                        f'<div class="media-user-name">Buyer {index}</div>'
+                        f'<div class="contact-item-message">Message {index}</div>'
+                        "</a>"
+                        for index in range(15)
+                    )
+                    result = {
+                        "objects": [
+                            {
+                                "type": "chat_bookmarks",
+                                "data": {"html": html},
+                            }
+                        ]
+                    }
+                else:
+                    self.requested_chat_ids = [item["id"] for item in objects]
+                    result = {
+                        "objects": [
+                            {"type": "chat_node", "id": item["id"], "data": False}
+                            for item in objects
+                        ]
+                    }
+                return SimpleNamespace(json=lambda: result)
 
         account = Account()
         chats, histories = asyncio.run(FunPayService().chat_histories(account))
@@ -111,6 +136,7 @@ class ChatHistoryServiceTests(unittest.TestCase):
         self.assertEqual(len(chats), 10)
         self.assertEqual(account.requested_chat_ids, list(range(10)))
         self.assertEqual(set(histories), set(range(10)))
+        self.assertEqual(account.request_values, ["false", "false"])
 
 
 class FakeBot:
