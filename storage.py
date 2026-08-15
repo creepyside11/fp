@@ -112,6 +112,9 @@ class Database:
                 "'Здравствуйте! Спасибо за обращение. Скоро отвечу вам.'"
             ),
             "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS next_raise_at TIMESTAMPTZ",
+            "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS monitor_last_poll_at TIMESTAMPTZ",
+            "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS monitor_last_success_at TIMESTAMPTZ",
+            "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS monitor_last_error TEXT",
         )
         for statement in migrations:
             await pool.execute(statement)
@@ -143,6 +146,17 @@ class Database:
                 telegram_id BIGINT NOT NULL REFERENCES funpay_bot_users(telegram_id) ON DELETE CASCADE,
                 chat_id TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, chat_id)
+            )
+            """
+        )
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS funpay_chat_cursors (
+                telegram_id BIGINT NOT NULL REFERENCES funpay_bot_users(telegram_id) ON DELETE CASCADE,
+                chat_id TEXT NOT NULL,
+                last_message_id BIGINT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (telegram_id, chat_id)
             )
             """
@@ -287,6 +301,60 @@ class Database:
             str(chat_id),
         )
         return inserted is not None
+
+    async def get_chat_cursors(self, telegram_id: int) -> dict[str, int]:
+        rows = await self._pool().fetch(
+            """
+            SELECT chat_id, last_message_id
+            FROM funpay_chat_cursors
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+        )
+        return {row["chat_id"]: row["last_message_id"] for row in rows}
+
+    async def save_chat_cursors(
+        self, telegram_id: int, cursors: dict[int | str, int]
+    ) -> None:
+        if not cursors:
+            return
+        await self._pool().executemany(
+            """
+            INSERT INTO funpay_chat_cursors (telegram_id, chat_id, last_message_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (telegram_id, chat_id) DO UPDATE SET
+                last_message_id = GREATEST(
+                    funpay_chat_cursors.last_message_id,
+                    EXCLUDED.last_message_id
+                ),
+                updated_at = NOW()
+            """,
+            [(telegram_id, str(chat_id), message_id) for chat_id, message_id in cursors.items()],
+        )
+
+    async def mark_monitor_success(self, telegram_id: int) -> None:
+        await self._pool().execute(
+            """
+            UPDATE funpay_bot_users SET
+                monitor_last_poll_at = NOW(),
+                monitor_last_success_at = NOW(),
+                monitor_last_error = NULL
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+        )
+
+    async def mark_monitor_error(self, telegram_id: int, error_name: str) -> None:
+        await self._pool().execute(
+            """
+            UPDATE funpay_bot_users SET
+                monitor_last_poll_at = NOW(),
+                monitor_last_error = $2
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+            error_name[:120],
+        )
 
     async def claim_greeting(self, telegram_id: int, chat_id: int | str) -> bool:
         inserted = await self._pool().fetchval(
