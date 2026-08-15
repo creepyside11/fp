@@ -332,29 +332,30 @@ class Database:
             [(telegram_id, str(chat_id), message_id) for chat_id, message_id in cursors.items()],
         )
 
-    async def mark_monitor_success(self, telegram_id: int) -> None:
+    async def mark_monitor_result(
+        self, telegram_id: int, successful: bool, error_name: str | None
+    ) -> None:
         await self._pool().execute(
             """
             UPDATE funpay_bot_users SET
                 monitor_last_poll_at = NOW(),
-                monitor_last_success_at = NOW(),
-                monitor_last_error = NULL
+                monitor_last_success_at = CASE
+                    WHEN $2 THEN NOW()
+                    ELSE monitor_last_success_at
+                END,
+                monitor_last_error = $3
             WHERE telegram_id = $1
             """,
             telegram_id,
+            successful,
+            error_name[:120] if error_name else None,
         )
 
+    async def mark_monitor_success(self, telegram_id: int) -> None:
+        await self.mark_monitor_result(telegram_id, True, None)
+
     async def mark_monitor_error(self, telegram_id: int, error_name: str) -> None:
-        await self._pool().execute(
-            """
-            UPDATE funpay_bot_users SET
-                monitor_last_poll_at = NOW(),
-                monitor_last_error = $2
-            WHERE telegram_id = $1
-            """,
-            telegram_id,
-            error_name[:120],
-        )
+        await self.mark_monitor_result(telegram_id, False, error_name)
 
     async def claim_greeting(self, telegram_id: int, chat_id: int | str) -> bool:
         inserted = await self._pool().fetchval(
