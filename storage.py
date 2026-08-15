@@ -12,6 +12,12 @@ class StoredSecretError(RuntimeError):
     pass
 
 
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"
+)
+
+
 class SecretCipher:
     """Encrypt stored credentials using a key derived from the bot token."""
 
@@ -35,6 +41,7 @@ class SecretCipher:
 class StoredCredentials:
     proxy_url: str
     golden_key: str
+    user_agent: str
 
 
 class Database:
@@ -115,6 +122,7 @@ class Database:
             "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS monitor_last_poll_at TIMESTAMPTZ",
             "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS monitor_last_success_at TIMESTAMPTZ",
             "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS monitor_last_error TEXT",
+            "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS funpay_user_agent TEXT",
         )
         for statement in migrations:
             await pool.execute(statement)
@@ -185,6 +193,7 @@ class Database:
                 encrypted_golden_key = NULL,
                 funpay_user_id = NULL,
                 funpay_username = NULL,
+                funpay_user_agent = NULL,
                 auto_raise_enabled = FALSE,
                 next_raise_at = NULL,
                 updated_at = NOW()
@@ -269,6 +278,17 @@ class Database:
             """,
             telegram_id,
             greeting_text,
+        )
+
+    async def set_user_agent(self, telegram_id: int, user_agent: str) -> None:
+        await self._pool().execute(
+            """
+            UPDATE funpay_bot_users
+            SET funpay_user_agent = $2, updated_at = NOW()
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+            user_agent,
         )
 
     async def list_background_users(self) -> list[asyncpg.Record]:
@@ -416,4 +436,5 @@ async def read_credentials(
     return StoredCredentials(
         proxy_url=cipher.decrypt(row["encrypted_proxy"]),
         golden_key=cipher.decrypt(row["encrypted_golden_key"]),
+        user_agent=row["funpay_user_agent"] or DEFAULT_USER_AGENT,
     )
