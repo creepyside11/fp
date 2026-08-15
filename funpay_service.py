@@ -12,13 +12,14 @@ import requests
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from bs4 import BeautifulSoup
 from FunPayAPI.common.exceptions import (
     RaiseError,
     RequestFailedError,
     UnauthorizedError,
 )
 
-from FunPayAPI import Account, Runner, enums
+from FunPayAPI import Account, enums, types
 from proxy_utils import proxy_mapping
 from storage import DEFAULT_USER_AGENT, Database, SecretCipher, StoredSecretError
 
@@ -44,7 +45,6 @@ class RaiseOutcome:
 class RuntimeSession:
     fingerprint: str
     account: Account
-    runner: Runner
     created_at: float
 
 
@@ -217,25 +217,37 @@ class FunPayService:
     async def save_lot(self, account: Account, lot_fields: Any) -> None:
         await self._thread(account.save_lot, lot_fields)
 
-    async def poll_events(self, runner: Runner) -> list[Any]:
-        def request() -> list[Any]:
-            for attempt in range(2):
-                try:
-                    return runner.parse_updates(runner.get_updates())
-                except UnauthorizedError:
-                    raise
-                except RequestFailedError as error:
-                    if attempt:
-                        raise
-                    if error.status_code == 400:
-                        runner.account.get(update_phpsessid=True)
-                    elif error.status_code in TRANSIENT_HTTP_STATUSES:
-                        time.sleep(2)
-                    else:
-                        raise
-            return []
+    @staticmethod
+    def _page_chats(account: Account) -> list[Any]:
+        """Read chat shortcuts from the normal HTML page when /runner/ returns 400."""
 
-        return await self._thread(request)
+        response = account.method(
+            "get",
+            "https://funpay.com/chat/",
+            {
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            },
+            {},
+            raise_not_200=True,
+        )
+        parser = BeautifulSoup(response.content.decode(), "html.parser")
+        result: list[Any] = []
+        for item in parser.find_all("a", {"class": "contact-item"}):
+            chat_id = item.get("data-id")
+            name = item.find("div", {"class": "media-user-name"})
+            message = item.find("div", {"class": "contact-item-message"})
+            if not chat_id or name is None or message is None:
+                continue
+            result.append(
+                types.ChatShortcut(
+                    int(chat_id),
+                    name.get_text(strip=True),
+                    message.get_text(strip=True),
+                    "unread" in item.get("class", []),
+                    str(item),
+                )
+            )
+        return result
 
     async def chat_histories(
         self, account: Account
@@ -244,6 +256,7 @@ class FunPayService:
 
         def request() -> tuple[list[Any], dict[int | str, list[Any]]]:
             chats: list[Any] = []
+            used_html_fallback = False
             for attempt in range(2):
                 try:
                     chats = account.request_chats()
@@ -251,11 +264,16 @@ class FunPayService:
                 except UnauthorizedError:
                     raise
                 except RequestFailedError as error:
-                    if attempt:
-                        raise
                     if error.status_code == 400:
-                        account.get(update_phpsessid=True)
+                        if not attempt:
+                            account.get(update_phpsessid=True)
+                            continue
+                        chats = self._page_chats(account)
+                        used_html_fallback = True
+                        break
                     elif error.status_code in TRANSIENT_HTTP_STATUSES:
+                        if attempt:
+                            raise
                         time.sleep(2)
                     else:
                         raise
@@ -267,39 +285,65 @@ class FunPayService:
             histories: dict[int | str, list[Any]] = {}
             failed_batches = 0
 
+            if used_html_fallback:
+                # An active conversation moves to the top. Five recent chats plus
+                # every unread chat keep requests low without missing old dialogs.
+                selected = chats[:5]
+                selected_ids = {chat.id for chat in selected}
+                selected.extend(
+                    chat
+                    for chat in chats
+                    if chat.unread and chat.id not in selected_ids
+                )
+                chats = selected
+
             # FunPay's runner endpoint is designed for packs of up to ten chat
             # objects. A failed pack is retried chat-by-chat so one malformed
             # conversation cannot disable notifications for every other chat.
             for offset in range(0, len(chats), 10):
                 batch = chats[offset : offset + 10]
                 chat_names = {chat.id: chat.name for chat in batch}
-                try:
-                    for attempt in range(2):
-                        try:
-                            histories.update(account.get_chats_histories(chat_names))
-                            break
-                        except UnauthorizedError:
-                            raise
-                        except RequestFailedError as error:
-                            if attempt:
-                                raise
-                            if error.status_code == 400:
-                                account.get(update_phpsessid=True)
-                            elif error.status_code in TRANSIENT_HTTP_STATUSES:
-                                time.sleep(2)
-                            else:
-                                raise
-                    continue
-                except UnauthorizedError:
-                    raise
-                except RequestFailedError as error:
-                    if error.status_code in TRANSIENT_HTTP_STATUSES:
-                        raise
+                if used_html_fallback:
                     failed_batches += 1
-                except Exception:  # noqa: BLE001 - retry each chat independently
+                if not used_html_fallback:
+                    try:
+                        for attempt in range(2):
+                            try:
+                                histories.update(
+                                    account.get_chats_histories(chat_names)
+                                )
+                                break
+                            except UnauthorizedError:
+                                raise
+                            except RequestFailedError as error:
+                                if error.status_code == 400:
+                                    if not attempt:
+                                        account.get(update_phpsessid=True)
+                                        continue
+                                    break
+                                if error.status_code in TRANSIENT_HTTP_STATUSES:
+                                    if attempt:
+                                        raise
+                                    time.sleep(2)
+                                    continue
+                                raise
+                        if len(histories) == len(batch):
+                            continue
+                    except UnauthorizedError:
+                        raise
+                    except RequestFailedError as error:
+                        if error.status_code in TRANSIENT_HTTP_STATUSES:
+                            raise
+                    except Exception:
+                        logger.warning(
+                            "FunPay batch chat history request failed; using individual requests",
+                            exc_info=True,
+                        )
                     failed_batches += 1
 
                 for chat in batch:
+                    if chat.id in histories:
+                        continue
                     try:
                         histories[chat.id] = account.get_chat_history(
                             chat.id, interlocutor_username=chat.name
@@ -312,6 +356,27 @@ class FunPayService:
             if chats and not histories and failed_batches:
                 raise RuntimeError("FunPay chat histories are unavailable")
             return chats, histories
+
+        return await self._thread(request)
+
+    async def orders(self, account: Account) -> list[Any]:
+        """Fetch sales from the documented orders page, independently of /runner/."""
+
+        def request() -> list[Any]:
+            for attempt in range(2):
+                try:
+                    return account.get_sells()[1]
+                except UnauthorizedError:
+                    raise
+                except RequestFailedError as error:
+                    if not attempt and error.status_code == 400:
+                        account.get(update_phpsessid=True)
+                        continue
+                    if not attempt and error.status_code in TRANSIENT_HTTP_STATUSES:
+                        time.sleep(2)
+                        continue
+                    raise
+            return []
 
         return await self._thread(request)
 
@@ -401,7 +466,6 @@ class NotificationManager:
         telegram_id = row["telegram_id"]
         encrypted_proxy = row["encrypted_proxy"]
         encrypted_key = row["encrypted_golden_key"]
-        user_agent = row["funpay_user_agent"] or DEFAULT_USER_AGENT
         settings_fingerprint = ":".join(
             str(bool(row[name]))
             for name in (
@@ -413,7 +477,7 @@ class NotificationManager:
             )
         )
         fingerprint = hashlib.sha256(
-            f"{encrypted_proxy}:{encrypted_key}:{user_agent}:{settings_fingerprint}".encode()
+            f"{encrypted_proxy}:{encrypted_key}:{DEFAULT_USER_AGENT}:{settings_fingerprint}".encode()
         ).hexdigest()
         cached = self.sessions.get(telegram_id)
         if (
@@ -425,15 +489,10 @@ class NotificationManager:
 
         proxy_url = self.cipher.decrypt(encrypted_proxy)
         golden_key = self.cipher.decrypt(encrypted_key)
-        account = await self.funpay.account(
-            golden_key,
-            proxy_url,
-            user_agent,
-        )
+        account = await self.funpay.account(golden_key, proxy_url)
         session = RuntimeSession(
             fingerprint,
             account,
-            Runner(account, disable_message_requests=True),
             time.monotonic(),
         )
         self.sessions[telegram_id] = session
@@ -464,8 +523,8 @@ class NotificationManager:
 
             if row["order_notifications_enabled"]:
                 try:
-                    events = await self.funpay.poll_events(session.runner)
-                    await self._deliver_events(row, session.account, events)
+                    orders = await self.funpay.orders(session.account)
+                    await self._poll_orders(row, orders)
                     monitor_succeeded = True
                 except UnauthorizedError:
                     raise
@@ -542,7 +601,9 @@ class NotificationManager:
                 # deliver its latest incoming message immediately.
                 candidates = [messages[-1]] if chat.unread else []
             else:
-                candidates = [message for message in messages if message.id > previous_id]
+                candidates = [
+                    message for message in messages if message.id > previous_id
+                ]
 
             for message in candidates:
                 await self._handle_message(row, account, message)
@@ -551,6 +612,35 @@ class NotificationManager:
                 changed_cursors[chat.id] = latest_id
 
         await self.database.save_chat_cursors(telegram_id, changed_cursors)
+
+    async def _poll_orders(self, row: Any, orders: list[Any]) -> None:
+        telegram_id = row["telegram_id"]
+        if not row["orders_monitor_initialized"]:
+            await self.database.seed_orders(
+                telegram_id, [str(order.id) for order in orders]
+            )
+            return
+
+        # get_sells() returns newest orders first. Database claims make this
+        # safe across restarts and overlapping polling iterations.
+        for order in reversed(orders):
+            order_id = str(order.id)
+            if await self.database.claim_order(telegram_id, order_id):
+                await self._send_order_notification(telegram_id, order)
+
+    async def _send_order_notification(self, telegram_id: int, order: Any) -> None:
+        description = order.description.strip()
+        if len(description) > 1800:
+            description = description[:1797] + "…"
+        await self._safe_send(
+            telegram_id,
+            "🛒 <b>Новый заказ FunPay</b>\n\n"
+            f"Заказ: <code>#{html.escape(str(order.id))}</code>\n"
+            f"Покупатель: <b>{html.escape(order.buyer_username)}</b>\n"
+            f"Товар: {html.escape(description)}\n"
+            f"Сумма: <b>{order.price:,.2f} ₽</b>\n"
+            f'<a href="https://funpay.com/orders/{html.escape(str(order.id), quote=True)}/">Открыть заказ</a>',
+        )
 
     async def _deliver_events(
         self, row: Any, account: Account, events: list[Any]
@@ -567,19 +657,7 @@ class NotificationManager:
                 event.type is enums.EventTypes.NEW_ORDER
                 and row["order_notifications_enabled"]
             ):
-                order = event.order
-                description = order.description.strip()
-                if len(description) > 1800:
-                    description = description[:1797] + "…"
-                await self._safe_send(
-                    row["telegram_id"],
-                    "🛒 <b>Новый заказ FunPay</b>\n\n"
-                    f"Заказ: <code>#{html.escape(order.id)}</code>\n"
-                    f"Покупатель: <b>{html.escape(order.buyer_username)}</b>\n"
-                    f"Товар: {html.escape(description)}\n"
-                    f"Сумма: <b>{order.price:,.2f} ₽</b>\n"
-                    f'<a href="https://funpay.com/orders/{html.escape(order.id, quote=True)}/">Открыть заказ</a>',
-                )
+                await self._send_order_notification(row["telegram_id"], event.order)
 
         # FunPayAPI can emit only a chat-change event when history parsing
         # fails. Fetching the last message explicitly fixes notifications for

@@ -41,7 +41,6 @@ class SecretCipher:
 class StoredCredentials:
     proxy_url: str
     golden_key: str
-    user_agent: str
 
 
 class Database:
@@ -122,7 +121,10 @@ class Database:
             "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS monitor_last_poll_at TIMESTAMPTZ",
             "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS monitor_last_success_at TIMESTAMPTZ",
             "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS monitor_last_error TEXT",
-            "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS funpay_user_agent TEXT",
+            (
+                "ALTER TABLE funpay_bot_users ADD COLUMN IF NOT EXISTS "
+                "orders_monitor_initialized BOOLEAN NOT NULL DEFAULT FALSE"
+            ),
         )
         for statement in migrations:
             await pool.execute(statement)
@@ -170,6 +172,16 @@ class Database:
             """
         )
         await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS funpay_seen_orders (
+                telegram_id BIGINT NOT NULL REFERENCES funpay_bot_users(telegram_id) ON DELETE CASCADE,
+                order_id TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (telegram_id, order_id)
+            )
+            """
+        )
+        await pool.execute(
             "DELETE FROM funpay_seen_messages WHERE created_at < NOW() - INTERVAL '90 days'"
         )
 
@@ -193,14 +205,17 @@ class Database:
                 encrypted_golden_key = NULL,
                 funpay_user_id = NULL,
                 funpay_username = NULL,
-                funpay_user_agent = NULL,
                 auto_raise_enabled = FALSE,
+                orders_monitor_initialized = FALSE,
                 next_raise_at = NULL,
                 updated_at = NOW()
             """,
             telegram_id,
             username,
             encrypted_proxy,
+        )
+        await self._pool().execute(
+            "DELETE FROM funpay_seen_orders WHERE telegram_id = $1", telegram_id
         )
 
     async def save_account(
@@ -218,6 +233,7 @@ class Database:
                 encrypted_golden_key = $3,
                 funpay_user_id = $4,
                 funpay_username = $5,
+                orders_monitor_initialized = FALSE,
                 updated_at = NOW()
             WHERE telegram_id = $1
             """,
@@ -226,6 +242,9 @@ class Database:
             encrypted_golden_key,
             funpay_user_id,
             funpay_username,
+        )
+        await self._pool().execute(
+            "DELETE FROM funpay_seen_orders WHERE telegram_id = $1", telegram_id
         )
 
     async def clear_key(self, telegram_id: int) -> None:
@@ -236,6 +255,7 @@ class Database:
                 funpay_user_id = NULL,
                 funpay_username = NULL,
                 auto_raise_enabled = FALSE,
+                orders_monitor_initialized = FALSE,
                 next_raise_at = NULL,
                 updated_at = NOW()
             WHERE telegram_id = $1
@@ -280,17 +300,6 @@ class Database:
             greeting_text,
         )
 
-    async def set_user_agent(self, telegram_id: int, user_agent: str) -> None:
-        await self._pool().execute(
-            """
-            UPDATE funpay_bot_users
-            SET funpay_user_agent = $2, updated_at = NOW()
-            WHERE telegram_id = $1
-            """,
-            telegram_id,
-            user_agent,
-        )
-
     async def list_background_users(self) -> list[asyncpg.Record]:
         return await self._pool().fetch(
             """
@@ -322,6 +331,38 @@ class Database:
         )
         return inserted is not None
 
+    async def seed_orders(self, telegram_id: int, order_ids: list[str]) -> None:
+        if order_ids:
+            await self._pool().executemany(
+                """
+                INSERT INTO funpay_seen_orders (telegram_id, order_id)
+                VALUES ($1, $2)
+                ON CONFLICT (telegram_id, order_id) DO NOTHING
+                """,
+                [(telegram_id, order_id) for order_id in order_ids],
+            )
+        await self._pool().execute(
+            """
+            UPDATE funpay_bot_users
+            SET orders_monitor_initialized = TRUE
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+        )
+
+    async def claim_order(self, telegram_id: int, order_id: str) -> bool:
+        inserted = await self._pool().fetchval(
+            """
+            INSERT INTO funpay_seen_orders (telegram_id, order_id)
+            VALUES ($1, $2)
+            ON CONFLICT (telegram_id, order_id) DO NOTHING
+            RETURNING order_id
+            """,
+            telegram_id,
+            order_id,
+        )
+        return inserted is not None
+
     async def get_chat_cursors(self, telegram_id: int) -> dict[str, int]:
         rows = await self._pool().fetch(
             """
@@ -349,7 +390,10 @@ class Database:
                 ),
                 updated_at = NOW()
             """,
-            [(telegram_id, str(chat_id), message_id) for chat_id, message_id in cursors.items()],
+            [
+                (telegram_id, str(chat_id), message_id)
+                for chat_id, message_id in cursors.items()
+            ],
         )
 
     async def mark_monitor_result(
@@ -436,5 +480,4 @@ async def read_credentials(
     return StoredCredentials(
         proxy_url=cipher.decrypt(row["encrypted_proxy"]),
         golden_key=cipher.decrypt(row["encrypted_golden_key"]),
-        user_agent=row["funpay_user_agent"] or DEFAULT_USER_AGENT,
     )

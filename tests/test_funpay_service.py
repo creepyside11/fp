@@ -3,6 +3,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
+from FunPayAPI.common.exceptions import RequestFailedError
+
 from funpay_service import (
     BalanceUnavailableError,
     FunPayService,
@@ -12,6 +15,14 @@ from funpay_service import (
 )
 from FunPayAPI import enums
 from storage import DEFAULT_USER_AGENT
+
+
+def request_failed(status_code=400):
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = b"bad request"
+    response.request = requests.Request("POST", "https://funpay.com/runner/").prepare()
+    return RequestFailedError(response)
 
 
 class FakeLot:
@@ -135,6 +146,51 @@ class ChatHistoryServiceTests(unittest.TestCase):
         self.assertEqual(account.requested_chat_ids, list(range(10)))
         self.assertEqual(set(histories), set(range(10)))
 
+    def test_http_400_uses_chat_page_and_individual_history(self):
+        class Account:
+            def __init__(self):
+                self.refreshes = 0
+                self.history_ids = []
+
+            def request_chats(self):
+                raise request_failed()
+
+            def get(self, update_phpsessid=False):
+                self.refreshes += int(update_phpsessid)
+                return self
+
+            def method(self, method, url, headers, payload, raise_not_200=False):
+                response = requests.Response()
+                response.status_code = 200
+                response._content = b"""
+                    <a class="contact-item unread" data-id="123">
+                      <div class="media-user-name">Buyer</div>
+                      <div class="contact-item-message">Hello</div>
+                    </a>
+                """
+                return response
+
+            def get_chat_history(self, chat_id, interlocutor_username=None):
+                self.history_ids.append(chat_id)
+                return [SimpleNamespace(id=501, text="Hello")]
+
+        account = Account()
+        chats, histories = asyncio.run(FunPayService().chat_histories(account))
+
+        self.assertEqual(account.refreshes, 1)
+        self.assertEqual(
+            [(chat.id, chat.name, chat.unread) for chat in chats],
+            [(123, "Buyer", True)],
+        )
+        self.assertEqual(account.history_ids, [123])
+        self.assertEqual(histories[123][0].id, 501)
+
+    def test_orders_use_documented_sells_page(self):
+        orders = [SimpleNamespace(id="ABC")]
+        account = SimpleNamespace(get_sells=lambda: (None, orders))
+
+        self.assertEqual(asyncio.run(FunPayService().orders(account)), orders)
+
 
 class FakeBot:
     def __init__(self):
@@ -150,6 +206,8 @@ class FakeDatabase:
         self.seen = set()
         self.greeted = set()
         self.cursors = {}
+        self.orders = set()
+        self.seeded_orders = []
 
     async def save_chat_target(self, telegram_id, chat_id, username):
         self.targets.append((telegram_id, chat_id, username))
@@ -176,6 +234,17 @@ class FakeDatabase:
 
     async def save_chat_cursors(self, telegram_id, cursors):
         self.cursors.update({str(chat_id): value for chat_id, value in cursors.items()})
+
+    async def seed_orders(self, telegram_id, order_ids):
+        self.seeded_orders.extend(order_ids)
+        self.orders.update((telegram_id, order_id) for order_id in order_ids)
+
+    async def claim_order(self, telegram_id, order_id):
+        key = (telegram_id, order_id)
+        if key in self.orders:
+            return False
+        self.orders.add(key)
+        return True
 
 
 class FakeFunPay:
@@ -349,6 +418,28 @@ class NotificationTests(unittest.TestCase):
         asyncio.run(manager._deliver_events(row, SimpleNamespace(id=42), [event]))
 
         self.assertEqual(funpay.replies, [(321, "Welcome!", "Buyer")])
+
+    def test_orders_are_baselined_then_new_order_is_notified_once(self):
+        bot = FakeBot()
+        database = FakeDatabase()
+        manager = NotificationManager(bot, database, None, None)
+        old = SimpleNamespace(
+            id="OLD", description="Old item", buyer_username="OldBuyer", price=10
+        )
+        new = SimpleNamespace(
+            id="NEW", description="New item", buyer_username="NewBuyer", price=25
+        )
+        row = self.row() | {"orders_monitor_initialized": False}
+
+        asyncio.run(manager._poll_orders(row, [old]))
+        row["orders_monitor_initialized"] = True
+        asyncio.run(manager._poll_orders(row, [new, old]))
+        asyncio.run(manager._poll_orders(row, [new, old]))
+
+        self.assertEqual(database.seeded_orders, ["OLD"])
+        self.assertEqual(len(bot.sent), 1)
+        self.assertIn("#NEW", bot.sent[0][1])
+        self.assertIn("NewBuyer", bot.sent[0][1])
 
 
 if __name__ == "__main__":
